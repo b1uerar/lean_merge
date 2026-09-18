@@ -67,16 +67,10 @@ assert result["verified"]
 
 `verified` 表示本次指定的目标证明通过上述检查，不表示文件里其他所有 `sorry` 都已解决。未选中的 `sorry` 会保留。Lean 源码可执行宏和编译期代码，本工具应处理可信代码，不提供执行沙箱。
 
-## normalize 与 AXLE 的区别
-
-这里的 `normalize` 为合并服务，输出选中定理及其依赖的闭合表达式；不指定目标时输出所有公开定理及其依赖。它保留公开声明的名字，将私有辅助声明重命名，删除不在依赖中的命令，并检查输出可重新展开及目标类型一致。它允许保留原有 `sorry`。
-
-它不实现 AXLE 的逐项源码变换开关，也不保留 tactic 写法、原格式和所有属性。证明项可能比原来的 tactic 代码大很多。合并时第一份文件的目标注释和属性会保留。
-
 ## 当前边界
 
 - 一次合并一个目标，支持 theorem/lemma、不同证明名、不同参数名、namespace/section、universe，以及 def/abbrev/instance/opaque 和私有辅助引理依赖。
-- 输入允许显式 `sorry`，但不接受语法或 elaboration 错误；不会像 AXLE 的 best-effort merge 那样保留错误版本。
+- 输入允许显式 `sorry`，但不接受语法或 elaboration 错误。
 - 不迁移文件内新声明的 structure/inductive 及其生成声明，也不迁移本地 axiom、unsafe/partial 定义。公共结构和实例可放进两份文件共同导入的模块。私有目标定理和新版 `module` 语法暂不支持。
 - 不重排第一份文件已有声明。位于目标之后的声明不能直接作为目标的依赖；第二份文件提供其完整定义时可以迁移副本。
 - Lean delaborator 不能保证所有表达式都往返成功。不能重新展开或不能确认类型一致时，命令失败，不输出未经验证的结果。
