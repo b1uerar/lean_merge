@@ -18,7 +18,7 @@ import time
 WORKER = Path(__file__).resolve().with_name("LeanMerge.lean")
 
 
-class MergeError(Exception):
+class MergeError(RuntimeError):
     """The inputs could not be merged and verified."""
 
 
@@ -56,6 +56,12 @@ class Runner:
         return stdout
 
 
+def _read_result(path: Path) -> dict:
+    if path.is_symlink() or not path.is_file():
+        raise MergeError("Lean result must be a regular file in its workspace")
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
 def _execute(
     mode: str, base: str, donor: str = "", *, target: str | None = None,
     proof: str | None = None, project: str | Path | None = None,
@@ -82,7 +88,8 @@ def _execute(
         if project_path:
             lake = str(prefix / "bin" / "lake")
             # setup-file resolves module artifacts and plugins for the actual imports.
-            for index, content in enumerate([base] + ([donor] if donor else [])):
+            inputs = [base] + ([donor] if donor else [])
+            for index, content in enumerate(inputs):
                 setup_source = work / f"Input{index}.lean"
                 setup_source.write_text(content, encoding="utf-8")
                 current = json.loads(runner.run([lake, "setup-file", str(setup_source)]))
@@ -99,14 +106,13 @@ def _execute(
         request_path = work / "request.json"
         result_path = work / "result.json"
         request = {
-            "mode": mode, "base": base.replace("\r\n", "\n"),
-            "donor": donor.replace("\r\n", "\n"), "target": target or "",
+            "mode": mode, "base": base, "donor": donor, "target": target or "",
             "proof": proof or "", "useDefEq": use_def_eq,
             "result": str(result_path), "setup": setup,
         }
         request_path.write_text(json.dumps(request, ensure_ascii=False), encoding="utf-8")
         runner.run([executable, "--run", str(WORKER), str(request_path)])
-        result = json.loads(result_path.read_text(encoding="utf-8"))
+        result = _read_result(result_path)
     if not result.get("okay") or not result.get("verified"):
         raise MergeError("Lean worker did not confirm verification")
     result["lean_version"] = version
@@ -170,7 +176,7 @@ def main(argv: list[str] | None = None) -> int:
             for name in inputs:
                 if name != "-" and (output.resolve() == Path(name).resolve() or
                     (output.exists() and os.path.samefile(output, name))):
-                    raise MergeError("Output must differ from both input files, including with --force")
+                    raise MergeError("Output must differ from all input files, including with --force")
             if output.is_symlink():
                 raise MergeError("Output must not be a symbolic link")
             if output.exists() and not args.force:
@@ -193,7 +199,7 @@ def main(argv: list[str] | None = None) -> int:
             print(f"Verified: {output}", file=sys.stderr)
         return 0
     except (MergeError, OSError, ValueError) as error:
-        if args.json:
+        if getattr(args, "json", False):
             print(json.dumps({"okay": False, "errors": [str(error)]}, ensure_ascii=False))
         else:
             print(f"lean-merge: {error}", file=sys.stderr)

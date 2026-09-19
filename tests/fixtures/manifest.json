@@ -1,0 +1,69 @@
+{
+  "lean_toolchain": "leanprover/lean4:v4.26.0",
+  "mathlib_revision": "2df2f0150c275ad53cb3c90f7c98ec15a56a1a67",
+  "source_run": "20260919T044208-1789792928593899416",
+  "files": {
+    "brualdi_ch1_5/Base.lean": {
+      "bytes": 1340,
+      "sha256": "c1871fe375a726c520282fbacea4cb4e4c27760cacf2718214325197b68bfe32",
+      "source": "round-001/items/brualdi_ch1_5_sol-bc95054faccfaa63/proof/revisions/0002.lean"
+    },
+    "brualdi_ch1_5/Donor.lean": {
+      "bytes": 28598,
+      "sha256": "ce1c0047d920d1ab9d60e083abd3611bd6b3cfbe5b4fc8db5312e2588d5759dd",
+      "source": "round-001/items/brualdi_ch1_5_sol-bc95054faccfaa63/proof/calls/r000002-n000-prove-work/workspace/Task.lean"
+    },
+    "egmo_2022_p5/Base.lean": {
+      "bytes": 11180,
+      "sha256": "7f206d9ff39bcba70d6ac118d04656a3406d337b8f0dcc1e5d69b9a29731186a",
+      "source": "round-001/items/egmo_2022_p5_sol-38f3ddf897a674f1/proof/revisions/0012.lean"
+    },
+    "egmo_2022_p5/CardColours.lean": {
+      "bytes": 3161,
+      "sha256": "db3864ead8922f41c3470ecbed41f78d6183772c3641a06f35023e0fdb770a1d",
+      "source": "round-001/items/egmo_2022_p5_sol-38f3ddf897a674f1/proof/calls/r000012-n000-prove/result.json#submitted_source"
+    },
+    "egmo_2022_p5/PerfectCoverCount.lean": {
+      "bytes": 23673,
+      "sha256": "34891fb7777be40e431fdae52c7774800246f2839956f176373fe3f9a2f0e760",
+      "source": "round-001/items/egmo_2022_p5_sol-38f3ddf897a674f1/proof/calls/r000012-n001-prove/result.json#submitted_source"
+    },
+    "egmo_2022_p5/CharpolyPath.lean": {
+      "bytes": 7291,
+      "sha256": "84c92d02e499e853fc4f8dafc19b327421f49810ad4f995b035f03501d6fb260",
+      "source": "round-001/items/egmo_2022_p5_sol-38f3ddf897a674f1/proof/calls/r000012-n002-prove/result.json#submitted_source"
+    }
+  },
+  "cases": {
+    "brualdi_ch1_5": {
+      "base": "brualdi_ch1_5/Base.lean",
+      "donor": "brualdi_ch1_5/Donor.lean",
+      "target": "brualdi_ch1_5",
+      "max_output_bytes": 6000000
+    },
+    "egmo_card_colours": {
+      "base": "egmo_2022_p5/Base.lean",
+      "donor": "egmo_2022_p5/CardColours.lean",
+      "target": "card_blackCell_eq_card_whiteCell",
+      "max_output_bytes": 700000
+    },
+    "egmo_perfect_cover_count": {
+      "base": "egmo_2022_p5/Base.lean",
+      "donor": "egmo_2022_p5/PerfectCoverCount.lean",
+      "target": "card_perfectCover_eq_gridMatchingCount",
+      "max_output_bytes": 3000000
+    },
+    "egmo_charpoly": {
+      "base": "egmo_2022_p5/Base.lean",
+      "donor": "egmo_2022_p5/CharpolyPath.lean",
+      "target": "charpoly_pathAdj",
+      "max_output_bytes": 3000000
+    }
+  },
+  "egmo_sequence": [
+    "egmo_card_colours",
+    "egmo_perfect_cover_count",
+    "egmo_charpoly"
+  ],
+  "sequence_max_output_bytes": 6000000
+}
