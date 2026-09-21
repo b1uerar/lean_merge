@@ -13,6 +13,13 @@ from lean_merge import MergeError, merge, normalize
 ROOT = Path(__file__).resolve().parents[1]
 
 
+def setUpModule():
+    # Child CLI processes inherit the same archive setting.
+    environment = patch.dict(os.environ, {"LEAN_TOOL_FAILURE_ARCHIVE": "0"})
+    environment.start()
+    unittest.addModuleCleanup(environment.stop)
+
+
 class MergeTests(unittest.TestCase):
     def check_merge(self, base, donor, **kwargs):
         result = merge(base, donor, **kwargs)
@@ -47,6 +54,20 @@ class MergeTests(unittest.TestCase):
             "universe v\ntheorem proof {B : Sort v} (b : B) : b = b := rfl\n",
         )
 
+    def test_local_function_with_unused_proof_parameters(self):
+        base = "theorem target (n : Nat) : n = n := by sorry\n"
+        for keyword in ["have", "let"]:
+            with self.subTest(keyword=keyword):
+                donor = f'''theorem solution (n : Nat) : n = n := by
+  {keyword} htop : ∀ {{x : Nat}}, x > 0 → x < n → x = x := by
+    intro x hxN hxr
+    rfl
+  rfl
+'''
+                self.check_merge(base, donor, target="target", proof="solution")
+                normalized = normalize(donor, target="solution")
+                self.check_merge(base, normalized["content"], target="target", proof="solution")
+
     def check_shared_expression(self, build):
         base = ("import Lean\nuniverse u\nnamespace N\n"
                 "theorem target {A : Type u} (x : A) : x = x := sorry\nend N\n")
@@ -68,7 +89,9 @@ theorem solution {A : Type v} (x : A) : x = x := by shared_proof
         self.assertTrue(result["inserted"])
         self.assertEqual(set(result["inserted"]), {
             name for command in result["added_commands"] for name in command["names"]})
-        self.assertNotIn('elab "shared_proof"', result["content"])
+        self.assertIn('elab "shared_proof"', result["content"])
+        self.assertIn("by shared_proof", result["content"])
+        self.assertNotIn("LeanMergeAux", result["content"])
         normalized = normalize(donor, target="solution")
         self.assertLess(len(normalized["content"].encode()), 100000)
         self.check_merge(base, normalized["content"], target="N.target", proof="solution")
@@ -119,7 +142,7 @@ theorem solution {A : Type v} (x : A) : x = x := by shared_proof
                 with self.subTest(base=base, newline=newline):
                     result = self.check_merge(base.replace("\n", newline), donor,
                                               target="target", proof="solution")
-                    self.assertIn("theorem target :", result["content"])
+                    self.assertIn("True.intro" if "True" in donor else ":= h", result["content"])
                     if newline == "\r\n":
                         self.assertNotIn("\n", result["content"].replace("\r\n", ""))
 
@@ -196,14 +219,14 @@ theorem solution {A : Type v} (x : A) : x = x := by shared_proof
         self.assertEqual(result["inserted"], [])
 
     def test_private_conflicting_dependency_not_reused(self):
-        with self.assertRaisesRegex(MergeError, "Type mismatch"):
+        with self.assertRaisesRegex(MergeError, "Type mismatch|Source name conflict"):
             merge("private opaque T : Type := Nat\ntheorem target (x : T) : x = x := sorry\n",
                   "private opaque T : Type := Bool\ntheorem solution (x : T) : x = x := rfl\n",
                   proof="solution")
         for helper in ("private theorem helper : True := sorry\n",
                        "private theorem helper : (1 : Nat) = 1 := rfl\n",
                        "namespace Other\nprivate theorem helper : True := True.intro\nend Other\n"):
-            with self.subTest(helper=helper), self.assertRaisesRegex(MergeError, "sorryAx"):
+            with self.subTest(helper=helper), self.assertRaisesRegex(MergeError, "sorryAx|Source name conflict"):
                 merge(helper + "theorem target : True := sorry\n",
                       "private theorem helper : True := sorry\ntheorem solution : True := helper\n",
                       target="target", proof="solution")
@@ -249,7 +272,7 @@ theorem solution {A : Type v} (x : A) : x = x := by shared_proof
         ]
         for base, donor, type_name in cases:
             with self.subTest(base=base, donor=donor):
-                with self.assertRaisesRegex(MergeError, "Type mismatch"):
+                with self.assertRaisesRegex(MergeError, "Type mismatch|Source name conflict"):
                     merge(base + f"theorem target (x : {type_name}) : x = x := sorry\n",
                           donor + f"theorem solution (x : {type_name}) : x = x := rfl\n",
                           proof="solution")
@@ -262,7 +285,8 @@ theorem solution {A : Type v} (x : A) : x = x := by shared_proof
             "theorem solution : 2 = 2 := Eq.refl box.value\n",
             proof="solution",
         )
-        self.assertIn("inductive _root_.LeanMergeAux", result["content"])
+        self.assertIn("structure Box where\n  value : Nat", result["content"])
+        self.assertIn("Eq.refl box.value", result["content"])
 
     def test_new_structure_avoids_future_constructor_name(self):
         result = self.check_merge(
@@ -315,21 +339,17 @@ theorem solution {A : Type v} (x : A) : x = x := by shared_proof
         self.assertEqual(result["targets"], ["target"])
 
     def test_conflicting_definitions_not_conflated(self):
-        with self.assertRaisesRegex(MergeError, "Type mismatch"):
+        with self.assertRaisesRegex(MergeError, "Type mismatch|Source name conflict"):
             merge(
                 "def f : Nat := 1\ntheorem target : f = 2 := sorry\n",
                 "def f : Nat := 2\ntheorem proof : f = 2 := rfl\n",
             )
 
     def test_helper_name_conflict_and_future_name(self):
-        result = self.check_merge(
-            "def helper : Nat := 1\ntheorem target : 2 = 2 := sorry\n"
-            "def LeanMergeAux0 : Nat := 7\n",
-            "def helper : Nat := 2\ntheorem proof : 2 = 2 := Eq.refl helper\n",
-        )
-        self.assertNotIn("LeanMergeAux0", result["inserted"])
-        self.assertTrue(result["inserted"])
-        self.assertIn("def helper : Nat := 1", result["content"])
+        with self.assertRaisesRegex(MergeError, "Source name conflict: helper"):
+            merge("def helper : Nat := 1\ntheorem target : 2 = 2 := sorry\n",
+                  "def helper : Nat := 2\ntheorem proof : 2 = 2 := Eq.refl helper\n")
+
 
     def test_reuse_complete_base_proof_for_donor_placeholder(self):
         result = self.check_merge(
@@ -379,8 +399,9 @@ theorem solution {A : Type v} (x : A) : x = x := by shared_proof
             "theorem target : True := (fun (_ : Right) => True.intro) Right.empty\n",
             target="target", proof="target",
         )
-        self.assertEqual(len(result["inserted"]), 2)
-        self.assertIn("noncomputable def _root_.LeanMergeAux", result["content"])
+        self.assertIn("Left", result["inserted"])
+        self.assertIn("Right", result["inserted"])
+        self.assertIn("def Field := Nat", result["content"])
         recorded = {name for command in result["added_commands"] for name in command["names"]}
         self.assertTrue(any(name.endswith(".field") for name in recorded))
         self.assertTrue(set(result["inserted"]).issubset(recorded))
@@ -520,26 +541,34 @@ theorem solution {A : Type v} (x : A) : x = x := by shared_proof
         self.assertEqual(result["proof"], "solution")
         self.assertEqual(result["inserted"], [])
 
-    def test_mutual_reuse_with_scoped_include_and_explicit_sibling_proof(self):
-        result = self.check_merge(
-            "section\nvariable (p : Prop) (h : p)\ninclude h in\nmutual\n"
-            "theorem helper : p := h\ntheorem target : p := sorry\nend\nend\n",
-            "theorem helper (p : Prop) (h : p) : p := sorry\n",
-            target="target", proof="helper")
-        self.assertIn("helper", result["reused"])
+    def test_explicit_proof_must_contain_a_complete_source_proof(self):
+        with self.assertRaisesRegex(MergeError, "sorryAx"):
+            merge(
+                "section\nvariable (p : Prop) (h : p)\ninclude h in\nmutual\n"
+                "theorem helper : p := h\ntheorem target : p := sorry\nend\nend\n",
+                "theorem helper (p : Prop) (h : p) : p := sorry\n",
+                target="target", proof="helper")
+
+    def test_mutual_does_not_reuse_target_dependent_proofs(self):
+        for base in (
+            "mutual\ntheorem target : True := sorry\ntheorem helper : True := target\nend\n",
+            "mutual\ntheorem helper : True := target\ntheorem target : True := sorry\nend\n",
+        ):
+            with self.subTest(base=base), self.assertRaisesRegex(MergeError, "Source name conflict|sorryAx"):
+                merge(base, "theorem helper : True := sorry\ntheorem solution : True := helper\n",
+                      target="target", proof="solution")
+
+    def test_moves_later_complete_dependency_before_target(self):
+        helper = "theorem helper : True := True.intro"
+        result = self.check_merge("theorem target : True := sorry\n" + helper + "\n",
+                                  "theorem helper : True := sorry\n"
+                                  "theorem target : True := by exact helper\n",
+                                  target="target", proof="target")
+        self.assertEqual(result["content"].count(helper), 1)
+        self.assertLess(result["content"].index(helper), result["content"].index("theorem target"))
+        self.assertIn("by exact helper", result["content"])
         self.assertEqual(result["inserted"], [])
 
-    def test_mutual_does_not_reuse_target_dependent_or_later_proofs(self):
-        for base in (
-            "mutual\ntheorem target : True := sorry\n"
-            "theorem helper : True := target\nend\n",
-            "mutual\ntheorem helper : True := target\n"
-            "theorem target : True := sorry\nend\n",
-            "theorem target : True := sorry\ntheorem helper : True := True.intro\n",
-        ):
-            with self.subTest(base=base), self.assertRaisesRegex(MergeError, "sorryAx"):
-                merge(base, "theorem helper : True := sorry\n"
-                      "theorem solution : True := helper\n", target="target", proof="solution")
 
     def test_mutual_automatic_target_follows_only_its_own_where_helper(self):
         downstream = "theorem downstream (n : Nat) : n = n := target n\n"
@@ -561,7 +590,7 @@ theorem solution {A : Type v} (x : A) : x = x := by shared_proof
     def test_mutual_other_declaration_type_still_checked(self):
         with self.assertRaisesRegex(MergeError, "changed the type of sibling"):
             merge("mutual\ntheorem target : True := sorry\n"
-                  "theorem sibling (x : LeanMergeAux0) : (LeanMergeAux0 : Type) = LeanMergeAux0 := rfl\nend\n",
+                  "theorem sibling (x : helper) : (helper : Type) = helper := rfl\nend\n",
                   "def helper : Type := Nat\n"
                   "theorem solution : True := (fun (_ : helper) => True.intro) (0 : Nat)\n",
                   target="target", proof="solution")
@@ -598,14 +627,15 @@ theorem solution {A : Type v} (x : A) : x = x := by shared_proof
             target="first", proof="solution")
         self.assertIn(second, result["content"])
 
-    def test_mutual_included_parameters_with_inferred_universes(self):
-        result = self.check_merge(
-            "universe u\nsection\nvariable {A : Sort u} (a : A)\ninclude a\nmutual\n"
-            "theorem sibling : True := True.intro\n"
-            "theorem target (x : B) : x = x := sorry\nend\nend\n",
-            "theorem solution {A : Sort u} (a : A) {B : Sort v} (x : B) : x = x := rfl\n",
-            target="target", proof="solution")
-        self.assertIn("theorem sibling : True := True.intro", result["content"])
+    def test_mutual_rejects_changed_sibling_universe_parameters(self):
+        # Moving the target out changes Lean's shared mutual universe parameters.
+        with self.assertRaisesRegex(MergeError, "changed the type of sibling"):
+            merge(
+                "universe u\nsection\nvariable {A : Sort u} (a : A)\ninclude a\nmutual\n"
+                "theorem sibling : True := True.intro\n"
+                "theorem target (x : B) : x = x := sorry\nend\nend\n",
+                "theorem solution {A : Sort u} (a : A) {B : Sort v} (x : B) : x = x := rfl\n",
+                target="target", proof="solution")
 
     def test_normalize_mutual_keeps_all_declared_theorems(self):
         result = normalize(
@@ -614,15 +644,15 @@ theorem solution {A : Type v} (x : A) : x = x := by shared_proof
             "end\nend N\n")
         self.assertTrue(result["verified"])
         self.assertEqual(set(result["targets"]), {"N.first", "N.Sub.first"})
-        self.assertIn("theorem _root_.N.first", result["content"])
-        self.assertIn("theorem _root_.N.Sub.first", result["content"])
+        self.assertIn("theorem first", result["content"])
+        self.assertIn("theorem Sub.first", result["content"])
 
     def test_definitional_equality(self):
         self.check_merge("theorem target : (fun x : Nat => x) 3 = 3 := sorry\n",
                          "theorem proof : 3 = 3 := rfl\n")
 
     def test_structural_comparison_option(self):
-        with self.assertRaisesRegex(MergeError, "Type mismatch"):
+        with self.assertRaisesRegex(MergeError, "Type mismatch|Source name conflict"):
             merge("theorem target : (fun x : Nat => x) 3 = 3 := sorry\n",
                   "theorem proof : 3 = 3 := rfl\n", use_def_eq=False)
 
@@ -700,9 +730,9 @@ theorem solution {A : Type v} (x : A) : x = x := by shared_proof
                            "theorem a : f n = n := by simp [f]\n"
                            "theorem b : f n = n := a n\nend N\n")
         self.assertTrue(result["verified"])
-        self.assertNotIn("namespace N", result["content"])
-        self.assertIn("_root_.N.f", result["content"])
-        self.assertIn("_root_.N.a", result["content"])
+        self.assertIn("namespace N", result["content"])
+        self.assertIn("def f := n + 0", result["content"])
+        self.assertIn("by simp [f]", result["content"])
 
     def test_normalize_sorry_then_merge(self):
         normalized = normalize("namespace N\ntheorem target : True := sorry\nend N\n")
@@ -722,7 +752,7 @@ theorem solution {A : Type v} (x : A) : x = x := by shared_proof
     def test_helper_cannot_change_unrelated_declaration_type(self):
         with self.assertRaisesRegex(MergeError, "changed the type of sibling"):
             merge("theorem target : True := sorry\n"
-                  "theorem sibling (x : LeanMergeAux0) : x = x := rfl\n",
+                  "theorem sibling (x : helper) : x = x := rfl\n",
                   "def helper : Type := Nat\n"
                   "theorem target : True := (fun (_ : helper) => True.intro) (0 : Nat)\n",
                   target="target", proof="target")
@@ -738,21 +768,19 @@ theorem solution {A : Type v} (x : A) : x = x := by shared_proof
             'section\r\nlocal notation "identity" => (fun n : Nat => n)\r\n'
             'theorem target (m : Nat) : m = m := by change identity m = m; rfl\r\nend')
         result = merge(current, candidate, target="N.target", proof="N.target")
-        self.assertEqual(result["strategy"], "expression")
-        self.assertNotIn("local notation", result["source"])
+        self.assertEqual(result["strategy"], "source")
+        self.assertIn("local notation", result["source"])
         self.assertIn("theorem sibling : True := True.intro\r\nend N\r\n", result["source"])
         self.assertNotIn("\n", result["source"].replace("\r\n", ""))
-        self.assertEqual(result["added_commands"], [])
+        self.assertTrue(any("local notation" in cmd["source"] for cmd in result["added_commands"]))
 
     def test_merge_conflicting_structure_and_private_target(self):
-        before = "private theorem target : True := sorry\n"
-        current = "structure Box where\n  value : Nat\n" + before
-        candidate = ("structure Box where\n  value : Bool\ndef box : Box := ⟨true⟩\n"
-                     "private theorem target : True := (fun (_ : Box) => True.intro) box\n")
-        result = merge(current, candidate, target="target", proof="target")
-        self.assertEqual(result["strategy"], "expression")
-        self.assertIn("structure Box where\n  value : Nat", result["source"])
-        self.assertTrue(any(command["names"] for command in result["added_commands"]))
+        with self.assertRaisesRegex(MergeError, "Source name conflict: Box"):
+            merge("structure Box where\n  value : Nat\nprivate theorem target : True := sorry\n",
+                  "structure Box where\n  value : Bool\ndef box : Box := ⟨true⟩\n"
+                  "private theorem target : True := (fun (_ : Box) => True.intro) box\n",
+                  target="target", proof="target")
+
 
     def test_merge_uses_current_and_needed_dependencies_only(self):
         current = "def value : Nat := 1\ntheorem target : value = 1 := by sorry\n"

@@ -8,6 +8,7 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest.mock import patch
 
 from lean_merge import MergeError, Runner, merge
 
@@ -15,6 +16,13 @@ from lean_merge import MergeError, Runner, merge
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
 MANIFEST = json.loads((FIXTURES / "manifest.json").read_text(encoding="utf-8"))
 PERMITTED_AXIOMS = {"propext", "Quot.sound", "Classical.choice"}
+
+
+def setUpModule():
+    # Child CLI processes inherit the same archive setting.
+    environment = patch.dict(os.environ, {"LEAN_TOOL_FAILURE_ARCHIVE": "0"})
+    environment.start()
+    unittest.addModuleCleanup(environment.stop)
 
 
 class FixtureTests(unittest.TestCase):
@@ -80,7 +88,10 @@ class RealMergeTests(unittest.TestCase):
         self.assertEqual(result["source"], content)
         self.assertLessEqual(set(result["axioms"]), PERMITTED_AXIOMS)
         recorded = {name for command in result["added_commands"] for name in command["names"]}
-        self.assertTrue(result["inserted"])
+        self.assertEqual(result["strategy"], "source")
+        self.assertNotIn("LeanMergeAux", content)
+        self.assertLessEqual(metadata["output_bytes"],
+                             len(base.encode()) + len(donor.encode()) + 4096)
         self.assertLessEqual(set(result["inserted"]), recorded)
         limit = case["max_output_bytes"] if current is None else MANIFEST["sequence_max_output_bytes"]
         self.assertLessEqual(metadata["output_bytes"], limit)

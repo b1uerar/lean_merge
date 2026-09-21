@@ -39,25 +39,25 @@
       "base": "brualdi_ch1_5/Base.lean",
       "donor": "brualdi_ch1_5/Donor.lean",
       "target": "brualdi_ch1_5",
-      "max_output_bytes": 6000000
+      "max_output_bytes": 34034
     },
     "egmo_card_colours": {
       "base": "egmo_2022_p5/Base.lean",
       "donor": "egmo_2022_p5/CardColours.lean",
       "target": "card_blackCell_eq_card_whiteCell",
-      "max_output_bytes": 700000
+      "max_output_bytes": 18437
     },
     "egmo_perfect_cover_count": {
       "base": "egmo_2022_p5/Base.lean",
       "donor": "egmo_2022_p5/PerfectCoverCount.lean",
       "target": "card_perfectCover_eq_gridMatchingCount",
-      "max_output_bytes": 3000000
+      "max_output_bytes": 38949
     },
     "egmo_charpoly": {
       "base": "egmo_2022_p5/Base.lean",
       "donor": "egmo_2022_p5/CharpolyPath.lean",
       "target": "charpoly_pathAdj",
-      "max_output_bytes": 3000000
+      "max_output_bytes": 22567
     }
   },
   "egmo_sequence": [
@@ -65,5 +65,5 @@
     "egmo_perfect_cover_count",
     "egmo_charpoly"
   ],
-  "sequence_max_output_bytes": 6000000
+  "sequence_max_output_bytes": 60000
 }

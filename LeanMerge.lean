@@ -12,6 +12,7 @@ structure Request where
   proof : String := ""
   result : String
   useDefEq : Bool := true
+  declarationsOnly : Bool := false
   setup : Option ModuleSetup := none
   deriving FromJson
 
@@ -19,8 +20,10 @@ structure CommandData where
   stx : Syntax
   before : Environment
   after : Environment
-  levels : List Name := []
-  included : List Name := []
+  refs : NameSet := {}
+  context : Array Nat := #[]
+  scopes : Array Nat := #[]
+  attributeTargets : NameSet := {}
   names : Array Name := #[]
 
 instance [Inhabited Environment] : Inhabited CommandData :=
@@ -33,6 +36,7 @@ structure Document where
   env : Environment
   commands : Array CommandData
   owners : NameMap Nat
+  scopeEnds : Std.HashMap Nat (Array Nat)
 
 def options : Options := ({} : Options).setBool `Elab.async false
   |>.set `maxRecDepth (8192 : Nat) |>.set `maxHeartbeats (2000000 : Nat)
@@ -41,6 +45,121 @@ def reportErrors (messages : MessageLog) : IO Unit := do
   if messages.hasErrors then
     for m in messages.toList do IO.eprintln (← m.toString)
     throw (IO.userError "Lean elaboration failed")
+
+partial def syntaxRefs (env : Environment) (stx : Syntax) (refs : NameSet) : NameSet := Id.run do
+  match stx with
+  | .ident _ _ _ resolved =>
+    let mut refs := refs
+    for r in resolved do
+      if let .decl n _ := r then refs := refs.insert n
+    return refs
+  | .node _ kind args =>
+    let mut refs := refs.insert kind
+    -- Syntax and macro registrations are dependencies even when expansion erases them.
+    for entry in macroAttribute.getEntries env kind do
+      refs := refs.insert entry.declName
+    for (_, category) in (Parser.parserExtension.getState env).categories do
+      if category.kinds.contains kind then refs := refs.insert category.declName
+    return args.foldl (fun acc s => syntaxRefs env s acc) refs
+  | _ => return refs
+
+partial def treeRefs (env : Environment) (mctx : MetavarContext)
+    (tree : InfoTree) (refs : NameSet) : NameSet := Id.run do
+  match tree with
+  | .context (.commandCtx ctx) t => return treeRefs ctx.env ctx.mctx t refs
+  | .context _ t => return treeRefs env mctx t refs
+  | .hole _ => return refs
+  | .node info children =>
+    let mut refs := refs
+    match info with
+    | .ofTermInfo i =>
+      refs := refs.insert i.elaborator ++ (instantiateExprMVarsImp mctx i.expr).2.getUsedConstantsAsSet
+    | .ofCommandInfo i => refs := refs.insert i.elaborator
+    | .ofTacticInfo i =>
+      refs := refs.insert i.elaborator
+      -- Intermediate tactic assignments include dependencies erased from the final proof.
+      for goal in i.goalsBefore do
+        refs := refs ++ (instantiateExprMVarsImp i.mctxAfter (.mvar goal)).2.getUsedConstantsAsSet
+    | .ofFieldInfo i => refs := refs.insert i.projName ++ i.val.getUsedConstantsAsSet
+    | .ofMacroExpansionInfo i =>
+      refs := syntaxRefs env i.output (syntaxRefs env i.stx refs)
+    | .ofOptionInfo i => refs := refs.insert i.declName
+    | _ => pure ()
+    for t in children do refs := treeRefs env mctx t refs
+    return refs
+
+def isScopeCommand (stx : Syntax) : Bool :=
+  [``Parser.Command.namespace, ``Parser.Command.section, ``Parser.Command.end].contains stx.getKind
+
+def isContextCommand (stx : Syntax) : Bool :=
+  [``Parser.Command.variable, ``Parser.Command.universe, ``Parser.Command.open,
+    ``Parser.Command.set_option, ``Parser.Command.include, ``Parser.Command.omit,
+    ``Parser.Command.export].contains stx.getKind
+
+def isDiagnostic (stx : Syntax) : Bool :=
+  [``Parser.Command.check, ``Parser.Command.check_failure, ``Parser.Command.print,
+    ``Parser.Command.printAxioms, ``Parser.Command.printEqns, ``Parser.Command.printSig,
+    ``Parser.Command.synth, ``Parser.Command.version, ``Parser.Command.moduleDoc].contains stx.getKind
+
+def isAttributeCommand (stx : Syntax) : Bool :=
+  [``Parser.Command.attribute, ``Parser.Command.grindPattern, ``Parser.Command.export].contains stx.getKind
+
+partial def hasKind (stx : Syntax) (kind : Name) : Bool :=
+  stx.getKind == kind || stx.getArgs.any (hasKind · kind)
+
+def hasUntrackedEffect (cmd : CommandData) : Bool :=
+  cmd.stx.getKind == ``Parser.Command.initialize ||
+  hasKind cmd.stx ``Parser.Command.eraseAttr ||
+  (cmd.names.isEmpty && !isScopeCommand cmd.stx && !isContextCommand cmd.stx &&
+    !isAttributeCommand cmd.stx && !isDiagnostic cmd.stx)
+
+def attributeTargets (stx : Syntax) (state : Command.State) : NameSet := Id.run do
+  let ids := if stx.getKind == ``Parser.Command.attribute then stx[4].getArgs
+    else if stx.getKind == ``Parser.Command.export then stx[3].getArgs
+    else if stx.getKind == ``Parser.Command.grindPattern then #[stx[2]] else #[]
+  let scope := state.scopes.head!
+  let mut refs := {}
+  for id in ids do
+    for (name, _) in ResolveName.resolveGlobalName state.env scope.opts scope.currNamespace scope.openDecls id.getId do
+      refs := refs.insert name
+  return refs
+
+def referenceFormat (ctx : PPContext) (expr : Expr) : FormatWithInfos :=
+  { fmt := .nil, infos := ({} : PrettyPrinter.InfoPerPos).insert 0 (.ofTermInfo {
+      elaborator := .anonymous, stx := .missing, lctx := ctx.lctx,
+      expectedType? := none, expr := (instantiateExprMVarsImp ctx.mctx expr).2 }) }
+
+-- Decode structured trace payloads without parsing printed names or invoking delaborators.
+def referenceContext (ctx : MessageDataContext) : PPContext :=
+  { env := ppExt.setState ctx.env {
+      ppExprWithInfos := fun ctx e => pure (referenceFormat ctx e)
+      ppConstNameWithInfos := fun ctx n => pure (referenceFormat ctx (.const n []))
+      ppTerm := fun _ _ => pure .nil
+      ppLevel := fun _ _ => pure .nil
+      ppGoal := fun _ _ => pure .nil }
+    mctx := ctx.mctx, lctx := ctx.lctx, opts := ctx.opts.setBool `pp.raw false }
+
+partial def messageRefs (msg : MessageData) (ctx : Option PPContext := none)
+    (refs : NameSet := {}) : BaseIO NameSet := do
+  match msg with
+  | .withContext ctx msg => messageRefs msg (some (referenceContext ctx)) refs
+  | .withNamingContext _ msg | .nest _ msg | .group msg | .tagged _ msg
+  | .ofWidget _ msg => messageRefs msg ctx refs
+  | .compose left right => messageRefs right ctx (← messageRefs left ctx refs)
+  | .trace _ msg children =>
+    let mut refs ← messageRefs msg ctx refs
+    for child in children do refs ← messageRefs child ctx refs
+    return refs
+  | .ofLazy f _ =>
+    let some msg := (← f ctx).get? MessageData | return refs
+    messageRefs msg ctx refs
+  | .ofFormatWithInfos fmt =>
+    let mut refs := refs
+    for (_, info) in fmt.infos do
+      if let .ofTermInfo i := info then refs := refs ++ i.expr.getUsedConstantsAsSet
+    return refs
+  | _ => return refs
+
 
 unsafe def analyze (source : String) (moduleName : Name)
     (setup? : Option ModuleSetup) : IO Document := do
@@ -63,19 +182,45 @@ unsafe def analyze (source : String) (moduleName : Name)
   reportErrors allMessages
   let mut snap := first.get
   let mut previous := initial
-  let mut previousScope := (Command.mkState initial messages opts).scopes.head!
+  let mut scopeOwners : Array Nat := #[]
+  let mut contexts : Array (Array Nat) := #[#[]]
+  let mut scopeEnds : Std.HashMap Nat (Array Nat) := {}
   let mut commands : Array CommandData := #[]
   repeat
     let state := snap.elabSnap.resultSnap.get.cmdState
     let env := state.env
     unless Parser.isTerminalCommand snap.stx do
+      let refs := match snap.elabSnap.infoTreeSnap.get.infoTree? with
+        | some tree => treeRefs env {} tree (syntaxRefs env snap.stx {})
+        | none => syntaxRefs env snap.stx {}
+      let i := commands.size
+      let attrTargets := attributeTargets snap.stx state
       commands := commands.push {
-        stx := snap.stx, before := previous, after := env
-        levels := previousScope.levelNames
-        included := previousScope.includedVars.map Name.eraseMacroScopes }
+        stx := snap.stx, before := previous, after := env, refs := refs ++ attrTargets
+        context := contexts.flatten, scopes := scopeOwners, attributeTargets := attrTargets }
+      while contexts.size < state.scopes.length do
+        contexts := contexts.push #[]
+        scopeOwners := scopeOwners.push i
+      while contexts.size > state.scopes.length do
+        let owner := scopeOwners.back!
+        scopeEnds := scopeEnds.insert owner ((scopeEnds[owner]?).getD #[] |>.push i)
+        scopeOwners := scopeOwners.pop
+        contexts := contexts.pop
+      if isContextCommand snap.stx then
+        contexts := contexts.modify (contexts.size - 1) (·.push i)
     previous := env
-    previousScope := state.scopes.head!
     if let some next := snap.nextCmdSnap? then snap := next.task.get else break
+  for msg in allMessages.toList do
+    if !msg.data.hasTag (· == `trace) then continue
+    let pos := ctx.fileMap.ofPosition msg.pos
+    let mut lo := 0
+    let mut hi := commands.size
+    while lo < hi do
+      let mid := (lo + hi) / 2
+      if commands[mid]!.stx.getPos?.getD 0 <= pos then lo := mid + 1 else hi := mid
+    if lo > 0 then
+      let refs ← messageRefs msg.data
+      commands := commands.modify (lo - 1) fun cmd => { cmd with refs := cmd.refs ++ refs }
   let mut owners : NameMap Nat := {}
   for (name, _) in previous.constants.map₂.toList do
     if initial.contains name then continue
@@ -88,7 +233,7 @@ unsafe def analyze (source : String) (moduleName : Name)
       throw (IO.userError s!"Cannot attribute local declaration {name} to source")
     owners := owners.insert name lo
     commands := commands.modify lo fun c => { c with names := c.names.push name }
-  return { source, header, initial, env := previous, commands, owners }
+  return { source, header, initial, env := previous, commands, owners, scopeEnds }
 
 def runMeta (env : Environment) (action : MetaM α) : IO α := do
   let (result, _, _) ← action.toIO
@@ -121,14 +266,6 @@ def theorems (doc : Document) : Array Name :=
 
 def declaredTheorems (doc : Document) : Array Name :=
   (theorems doc).filter fun name => (theoremSyntax? doc name).isSome
-
-partial def hasScopedInclude (stx : Syntax) (pos : String.Pos.Raw) : Bool :=
-  match stx.getPos?, stx.getTailPos? with
-  | some start, some stop =>
-    start ≤ pos && pos < stop &&
-      ((stx.getKind == ``Parser.Command.in && stx[0].getKind == ``Parser.Command.include) ||
-        stx.getArgs.any (hasScopedInclude · pos))
-  | _, _ => false
 
 -- A mutual command owns several declarations; only the target and its helpers may be replaced.
 def theoremDeclarations (doc : Document) (target : Name) : NameSet := Id.run do
@@ -173,7 +310,7 @@ partial def hasOwnSorry (doc : Document) (declarations : NameSet) (name : Name)
 def permittedAxiom (name : Name) : Bool :=
   [``propext, ``Classical.choice, ``Quot.sound].contains name
 
-def checkProofs (names : Array Name) : MetaM Unit := do
+def checkedAxioms (names : Array Name) : MetaM (Array Name) := do
   let env ← getEnv
   -- All roots are checked in the same environment; visit their shared dependencies once.
   let mut state : CollectAxioms.State := {}
@@ -183,6 +320,9 @@ def checkProofs (names : Array Name) : MetaM Unit := do
     unless bad.isEmpty do
       throwError "Proof {name} depends on unsupported axioms or unfinished proofs: {bad}"
     state := next
+  return state.axioms
+
+def checkProofs (names : Array Name) : MetaM Unit := discard (checkedAxioms names)
 
 def checkProof (name : Name) : MetaM Unit := checkProofs #[name]
 
@@ -192,226 +332,12 @@ def aligned (expr : Expr) (fromParams toParams : List Name) : Expr :=
 def equalTypes (a b : Expr) (useDefEq : Bool) : MetaM Bool :=
   if useDefEq then withTransparency .all (isDefEq a b) else pure (a == b)
 
-structure SavedCommand where
-  names : Array String
-  source : String
-  deriving FromJson, ToJson
-
-def checkImportEffects (before after : Document) (target : Option Name := none) : IO Unit :=
-  runMeta after.env do
-    let stage := if target.isSome then "Merge" else "Additional imports"
-    let replaced := target.map (theoremDeclarations before) |>.getD {}
-    let mut beforeState : CollectAxioms.State := {}
-    let mut afterState : CollectAxioms.State := {}
-    for (name, _) in before.owners.toArray do
-      if replaced.contains name then continue
-      let some old := before.env.find? name | throwError "Missing original declaration: {name}"
-      let some new := after.env.find? name | throwError "{stage} removed a declaration: {name}"
-      unless old.levelParams.length == new.levelParams.length &&
-          (← equalTypes old.type (aligned new.type new.levelParams old.levelParams) true) do
-        throwError "{stage} changed the type of {name}"
-      if isTheorem old then
-        let (_, nextBefore) := ((CollectAxioms.collect name).run before.env).run beforeState
-        -- Only retain visits from valid roots; unfinished proofs must not poison later checks.
-        if nextBefore.axioms.all permittedAxiom then
-          beforeState := nextBefore
-          let (_, nextAfter) := ((CollectAxioms.collect name).run after.env).run afterState
-          let bad := nextAfter.axioms.filter (!permittedAxiom ·)
-          unless bad.isEmpty do
-            throwError "{stage} introduced unsupported axioms in {name}: {bad}"
-          afterState := nextAfter
-      else
-        if let some value := old.value? (allowOpaque := true) then
-          let some newValue := new.value? (allowOpaque := true)
-            | throwError "{stage} changed the declaration kind of {name}"
-          unless ← equalTypes value (aligned newValue new.levelParams old.levelParams) true do
-            throwError "{stage} changed the value of {name}"
-
-structure TransferState where
-  shared : Std.HashMap ExprStructEq Expr := {}
-  closed : Std.HashMap (Expr × Expr) Name := {}
-  mapping : NameMap Name := {}
-  visiting : NameSet := {}
-  emitted : Array Name := #[]
-  reused : Array Name := #[]
-  reserved : NameSet := {}
-  serial : Nat := 0
-
-abbrev TransferM := StateT TransferState MetaM
-
 partial def rewrite (expr : Expr) (mapping : NameMap Name) : Expr :=
   expr.replace fun e => match e with
     | .const n levels => (mapping.find? n).map (Expr.const · levels)
     | .proj n i value => some <| Expr.proj ((mapping.find? n).getD n) i (rewrite value mapping)
     | _ => none
 
-def dependencies (expr : Expr) : MetaM (Array Name) := do
-  let (_, names) ← (expr.forEach fun e => do
-    match e with
-    | .const n _ | .proj n _ _ => modify (fun names : NameSet => names.insert n)
-    | _ => pure () : StateRefT NameSet MetaM Unit).run {}
-  return names.toArray
-
--- Reusing a declaration may orphan dependencies transferred while comparing its value.
-def requiredTransfers (before : Environment) (root : Name) : MetaM NameSet := do
-  let mut required : NameSet := {}
-  let mut pending := #[root]
-  while !pending.isEmpty do
-    let name := pending.back!
-    pending := pending.pop
-    if before.contains name || required.contains name then continue
-    required := required.insert name
-    let info ← getConstInfo name
-    pending := pending ++ (← dependencies info.type)
-    if let some value := info.value? (allowOpaque := true) then
-      pending := pending ++ (← dependencies value)
-    match info with
-    | .inductInfo val =>
-      -- Rendering an inductive emits its entire mutual group and all constructors.
-      pending := pending ++ val.all.toArray ++ val.ctors.toArray
-    | .ctorInfo val => pending := pending.push val.induct
-    | .recInfo val =>
-      pending := pending ++ val.all.toArray
-      for rule in val.rules do
-        pending := pending.push rule.ctor ++ (← dependencies rule.rhs)
-    | _ => pure ()
-  return required
-
-def reservePrefixes (names : NameSet) : Name → NameSet
-  | .anonymous => names
-  | name@(.str parent _) | name@(.num parent _) => reservePrefixes (names.insert name) parent
-
-def reservedPrefixes (env : Environment) : NameSet :=
-  env.constants.fold (init := ({} : NameSet)) fun ns name _ => reservePrefixes ns name
-
-def freshName : TransferM Name := do
-  let mut serial := (← get).serial
-  repeat
-    let n := Name.mkSimple s!"LeanMergeAux{serial}"
-    serial := serial + 1
-    unless (← getEnv).contains n || (← get).reserved.contains n do
-      modify fun s => { s with serial }
-      return n
-  throwError "Unable to allocate a declaration name"
-
-def sharingThreshold : Nat := 64
-
--- Count printed tree nodes with a budget, without expanding an entire shared DAG.
-def boundedExprSize (e : Expr) (limit : Nat) : Nat :=
-  match limit with
-  | 0 => 0
-  | n + 1 =>
-    match e with
-    | .app f a | .lam _ f a _ | .forallE _ f a _ =>
-      let size := boundedExprSize f n
-      1 + size + boundedExprSize a (n - size)
-    | .letE _ t v b _ =>
-      let ts := boundedExprSize t n
-      let vs := boundedExprSize v (n - ts)
-      1 + ts + vs + boundedExprSize b (n - ts - vs)
-    | .mdata _ b | .proj _ _ b => 1 + boundedExprSize b n
-    | _ => 1
-
-partial def shareSubexpressions (value : Expr) : TransferM Expr :=
-  Meta.transform value (post := fun e => do
-    if boundedExprSize e sharingThreshold < sharingThreshold then return .done e
-    -- Keep unfinished proofs in their owning declarations for automatic target discovery.
-    if e.hasSorry then return .done e
-    if let some shared := (← get).shared.get? { val := e } then return .done shared
-    let type ← shareSubexpressions (← inferType e)
-    let closure ← Closure.mkValueTypeClosure type e false
-    if closure.value.hasSorry then return .done e
-    -- Closure abstracts local variables and universes; Expr equality ignores binder names.
-    let key := (closure.type, closure.value)
-    let name ← if let some name := (← get).closed.get? key then pure name else do
-      let name ← freshName
-      if ← isProp closure.type then
-        addDecl (.thmDecl {
-          name, levelParams := closure.levelParams.toList
-          type := closure.type, value := closure.value })
-      else
-        let hints := ReducibilityHints.regular (getMaxHeight (← getEnv) closure.value + 1)
-        addDecl (.defnDecl (← mkDefinitionValInferringUnsafe name closure.levelParams.toList
-          closure.type closure.value hints))
-      modify fun s => { s with
-        closed := s.closed.insert key name
-        emitted := s.emitted.push name }
-      pure name
-    let shared := mkAppN (mkConst name closure.levelArgs.toList) closure.exprArgs
-    modify fun s => { s with shared := s.shared.insert { val := e } shared }
-    return .done shared)
-
-def declaration (info : ConstantInfo) (name : Name) (type value : Expr) : MetaM Declaration := do
-  match info with
-  | .thmInfo v => return .thmDecl { v with name, type, value, all := [name] }
-  | .defnInfo v =>
-    unless v.safety == .safe do throwError "Unsafe/partial definition is unsupported: {info.name}"
-    return .defnDecl { v with name, type, value, all := [name] }
-  | .opaqueInfo v =>
-    if v.isUnsafe then throwError "Unsafe opaque is unsupported: {info.name}"
-    return .opaqueDecl { v with name, type, value, all := [name] }
-  | _ => throwError "Cannot transfer {info.name}: only theorem, def, abbrev, instance and opaque dependencies are supported"
-
--- Close a sibling proof over the environment before its mutual block. Never unfold the target.
-def closeSiblingExpr (source before : Environment) (allowed : NameSet) (expr : Expr) : MetaM Expr :=
-  Core.transform expr (pre := fun e => do
-    let .const name levels := e | return .continue
-    if before.contains name then return .done e
-    unless allowed.contains name do throwError "Unavailable sibling dependency: {name}"
-    let some info := source.find? name | throwError "Missing sibling dependency: {name}"
-    let value ← match info with
-      | .thmInfo val => pure val.value
-      | .defnInfo val =>
-        unless val.safety == .safe do throwError "Unsafe sibling dependency: {name}"
-        pure val.value
-      | _ => throwError "Cannot unfold sibling dependency: {name}"
-    return .visit (value.instantiateLevelParams info.levelParams levels))
-
-def availableSiblings (base : Document) (command : CommandData) (target : Name)
-    (targetPos : String.Pos.Raw) : MetaM (NameMap ConstantInfo) := do
-  let excluded := theoremDeclarations base target
-  let allowed := command.names.foldl (fun names name =>
-    if excluded.contains name then names else names.insert name) ({} : NameSet)
-  let mut siblings := {}
-  for name in command.names do
-    if excluded.contains name then continue
-    let some stx := theoremSyntax? base name | continue
-    let some pos := stx.getPos? | continue
-    if pos ≥ targetPos then continue
-    let some (.thmInfo info) := base.env.find? name | continue
-    unless (← axioms base.env name).all permittedAxiom do continue
-    let saved ← saveState
-    try
-      let type ← closeSiblingExpr command.after command.before allowed info.type
-      let value ← closeSiblingExpr command.after command.before allowed info.value
-      let info := { info with type, value, all := [name] }
-      addDecl (.thmDecl info)
-      siblings := siblings.insert name (.thmInfo info)
-    catch _ => saved.restore
-  return siblings
-
-def inlineSiblings (expr : Expr) (siblings : NameMap ConstantInfo) : Expr :=
-  expr.replace fun e => do
-    let .const name levels := e | none
-    let info ← siblings.find? name
-    let value ← info.value?
-    return value.instantiateLevelParams info.levelParams levels
-
-def inductiveGroup (donor : Document) (info : InductiveVal) : IO (Array ConstantInfo) := do
-  let mut group := #[]
-  for name in info.all do
-    let some (.inductInfo val) := donor.env.find? name
-      | throw (IO.userError s!"Missing inductive declaration: {name}")
-    group := group.push (.inductInfo val)
-    for ctor in val.ctors do
-      let some ci := donor.env.find? ctor | throw (IO.userError s!"Missing constructor: {ctor}")
-      group := group.push ci
-  for (name, _) in donor.owners.toArray do
-    if let some (.recInfo val) := donor.env.find? name then
-      if val.all == info.all then group := group.push (.recInfo val)
-  return group
-
--- Types alone are insufficient: constructor order and recursor reduction rules matter.
 def checkInductiveMember (info : ConstantInfo) (mapping : NameMap Name)
     (useDefEq : Bool) : MetaM Unit := do
   let mapped := fun n => (mapping.find? n).getD n
@@ -440,197 +366,55 @@ def checkInductiveMember (info : ConstantInfo) (mapping : NameMap Name)
       unless mapped r.ctor == s.ctor && r.nfields == s.nfields && (← eq r.rhs s.rhs) do mismatch
   | _, _ => mismatch
 
-def addInductive (decl : Declaration) : MetaM Unit := do
-  addDecl decl
-  let .inductDecl _ _ types _ := decl | return
-  -- The kernel creates nested recursors, but addDecl only exposes the primary ones.
-  for type in types do
-    let mut i := 1
-    repeat
-      let name := (mkRecName type.name).appendIndexAfter i
-      let env ← getEnv
-      let some ci := env.toKernelEnv.find? name | break
-      let result ← env.addConstAsync name .recursor
-      result.commitConst result.asyncEnv (info? := ci)
-      result.commitCheckEnv result.asyncEnv
-      setEnv result.mainEnv
-      i := i + 1
-
 def existingName? (env : Environment) (name : Name) : Option Name := Id.run do
   if env.contains name then return some name
-  unless isPrivateName name do return none
-  let candidates := env.constants.fold (init := #[]) fun names candidate _ =>
-    if isPrivateName candidate && privateToUserName candidate == privateToUserName name then
-      names.push candidate
-    else names
-  return if candidates.size == 1 then some candidates[0]! else none
+  let mut found := none
+  for (candidate, _) in env.constants.map₂.toList do
+    if privateToUserName candidate == privateToUserName name then
+      if found.isSome then return none
+      found := some candidate
+  return found
 
-mutual
--- Resolve constants before printing. Textual substitution would confuse binders and namespaces.
-partial def transfer (donor : Document) (useDefEq : Bool) (name : Name) : TransferM Name := do
-  if let some mapped := (← get).mapping.find? name then return mapped
-  unless donor.owners.contains name do
-    unless (← getEnv).contains name do throwError "Missing imported dependency: {name}"
-    return name
-  if (← get).visiting.contains name then throwError "Cyclic dependency while transferring {name}"
-  modify fun s => { s with visiting := s.visiting.insert name }
-  let some info := donor.env.find? name | throwError "Missing donor declaration: {name}"
-  match info with
-  | .inductInfo val =>
-    let saved ← get
-    let checkpoint ← liftM Lean.Meta.saveState
-    try return ← transferInductive donor useDefEq val name true
-    catch _ =>
-      -- A conflicting helper type is a new declaration, including its constructors
-      -- and recursors. Undo any tentative reuse before transferring the whole group.
-      checkpoint.restore
-      set saved
-      return ← transferInductive donor useDefEq val name false
-  | .ctorInfo val =>
-    discard <| transfer donor useDefEq val.induct
-    return (← get).mapping.get! name
-  | .recInfo val =>
-    for induct in val.all do discard <| transfer donor useDefEq induct
-    return (← get).mapping.get! name
-  | _ => pure ()
-  for dep in ← dependencies info.type do discard <| transfer donor useDefEq dep
-  let type := rewrite info.type (← get).mapping
-  let env ← getEnv
-  let existing := (existingName? env name).bind env.find?
-  -- A proven base theorem may replace a donor's placeholder of the same type.
-  if let some old := existing then
-    if isTheorem info && isTheorem old && info.levelParams.length == old.levelParams.length then
-      if ← equalTypes (aligned type info.levelParams old.levelParams) old.type useDefEq then
-        if (← collectAxioms old.name).all permittedAxiom then
-          modify fun s => { s with
-            mapping := s.mapping.insert name old.name
-            reused := s.reused.push old.name, visiting := s.visiting.erase name }
-          return old.name
-  let some value := info.value? (allowOpaque := true)
-    | throwError "Unsupported dependency {name}: local axioms cannot be transplanted"
-  for dep in ← dependencies value do discard <| transfer donor useDefEq dep
-  let value := rewrite value (← get).mapping
-  if let some old := existing then
-    if !isTheorem info && !isTheorem old && info.levelParams.length == old.levelParams.length then
-      if let some oldValue := old.value? (allowOpaque := true) then
-        if (← equalTypes (aligned type info.levelParams old.levelParams) old.type useDefEq) &&
-            (← equalTypes (aligned value info.levelParams old.levelParams) oldValue useDefEq) then
-          modify fun s => { s with
-            mapping := s.mapping.insert name old.name
-            reused := s.reused.push old.name, visiting := s.visiting.erase name }
-          return old.name
-  let fresh ← freshName
-  let value ← shareSubexpressions value
-  addDecl (← declaration info fresh type value)
-  modify fun s => { s with
-    mapping := s.mapping.insert name fresh
-    emitted := s.emitted.push fresh, visiting := s.visiting.erase name }
-  return fresh
+structure SavedCommand where
+  names : Array String
+  source : String
+  deriving FromJson, ToJson
 
-partial def transferInductive (donor : Document) (useDefEq : Bool)
-    (info : InductiveVal) (requested : Name) (reuseExisting : Bool) : TransferM Name := do
-  let group ← inductiveGroup donor info
-  if group.any (·.isUnsafe) then throwError "Unsafe inductive is unsupported: {info.name}"
-  let env ← getEnv
-  let mut existing : NameMap Name := {}
-  for n in info.all do
-    if let some old := existingName? env n then existing := existing.insert n old
-  let reuse := reuseExisting && info.all.all existing.contains
-  -- Reserve the entire mutually recursive group before following its dependencies.
-  for n in info.all do
-    let fresh ← if reuse then pure (existing.get! n) else freshName
-    modify fun s => { s with mapping := s.mapping.insert n fresh }
-  for ci in group do
-    unless info.all.contains ci.name do
-      let some parent := info.all.find? (·.isPrefixOf ci.name)
-        | throwError "Unsupported generated inductive name: {ci.name}"
-      let fresh := ci.name.replacePrefix parent ((← get).mapping.get! parent)
-      modify fun s => { s with mapping := s.mapping.insert ci.name fresh }
-  for ci in group do
-    for dep in ← dependencies ci.type do discard <| transfer donor useDefEq dep
-    if let .recInfo val := ci then
-      for rule in val.rules do
-        for dep in ← dependencies rule.rhs do discard <| transfer donor useDefEq dep
-  let mapping := (← get).mapping
-  unless reuse do
-    let mut types := []
-    for n in info.all do
-      let val := (donor.env.find? n).get!.inductiveVal!
-      let ctors := val.ctors.map fun ctor => {
-        name := mapping.get! ctor
-        type := rewrite (donor.env.find? ctor).get!.type mapping : Constructor }
-      types := types ++ [{ name := mapping.get! n, type := rewrite val.type mapping, ctors }]
-    addInductive (.inductDecl info.levelParams info.numParams types false)
-  for ci in group do checkInductiveMember ci mapping useDefEq
-  modify fun s => { s with
-    visiting := group.foldl (fun ns ci => ns.erase ci.name) s.visiting
-    reused := if reuse then s.reused ++ group.map (fun ci => mapping.get! ci.name) else s.reused
-    emitted := if reuse then s.emitted else s.emitted.push (mapping.get! info.all.head!) }
-  return mapping.get! requested
-end
-
-def printOptions : Options := options.setBool `pp.all true
-  -- Applied implicit lambdas do not round-trip as `(@fun ...) args` in Lean.
-  |>.setBool `pp.beta true
-  |>.setBool `pp.funBinderTypes false |>.setBool `pp.letVarTypes false
-  |>.setBool `pp.proofs true |>.setBool `pp.universes true
-  |>.setBool `pp.privateNames false
-  |>.setBool `pp.fullNames true |>.setBool `pp.notation false
-  |>.setBool `pp.deepTerms true |>.set `pp.maxSteps (10000000 : Nat)
-  |>.setBool `pp.fieldNotation false |>.setBool `pp.structureInstances false
-  |>.set `pp.width (100 : Nat)
-
-def renderInductive (info : InductiveVal) (existingLevels : List Name)
-    (siblings : NameMap ConstantInfo := {}) : MetaM String := do
-  -- Recursive names are local variables while Lean elaborates an inductive block.
-  withOptions (fun _ => printOptions.setBool `pp.universes false) do
-    let mut content := "set_option autoImplicit false in\nmutual\n"
-    for n in info.all do
-      let val := (← getConstInfo n).inductiveVal!
-      let newLevels := val.levelParams.filter (!existingLevels.contains ·)
-      let levels := if newLevels.isEmpty then "" else
-        ".{" ++ String.intercalate ", " (newLevels.map Name.toString) ++ "}"
-      content := content ++ (← forallBoundedTelescope (inlineSiblings val.type siblings) (some val.numParams) fun params result => do
-        let mut binders := ""
-        for param in params do
-          let decl ← param.fvarId!.getDecl
-          let name := (← ppExpr param).pretty 100
-          let type := (← ppExpr decl.type).pretty 100
-          let (left, right) := match decl.binderInfo with
-            | .default => ("(", ")")
-            | .implicit => ("{", "}")
-            | .strictImplicit => ("⦃", "⦄")
-            | .instImplicit => ("[", "]")
-          binders := binders ++ s!" {left}{name} : {type}{right}"
-        let mut text := s!"inductive _root_.{n}{levels}{binders} :\n  {(← ppExpr result).pretty 100} where\n"
-        for ctor in val.ctors do
-          let mut type := inlineSiblings (← getConstInfo ctor).type siblings
-          for param in params do type := type.bindingBody!.instantiate1 param
-          let typeText := ((← ppExpr type).pretty 100).replace "\n" "\n    "
-          let ctorName := Name.mkSimple ctor.getString!
-          text := text ++ s!"  | {ctorName} :\n    {typeText}\n"
-        return text)
-    return content ++ "end\n"
-
-def render (info : ConstantInfo) (name : Name) (existingLevels : List Name := [])
-    (siblings : NameMap ConstantInfo := {}) : MetaM String := do
-  if let .inductInfo val := info then return ← renderInductive val existingLevels siblings
-  let some value := info.value? (allowOpaque := true) | throwError "No value for {info.name}"
-  let value := inlineSiblings value siblings
-  let kind := match info with
-    | .thmInfo _ => "theorem"
-    | .opaqueInfo _ => "noncomputable opaque"
-    | .defnInfo v => if v.hints.isAbbrev then "noncomputable abbrev" else "noncomputable def"
-    | _ => "def"
-  let newLevels := info.levelParams.filter (!existingLevels.contains ·)
-  let levels := if newLevels.isEmpty then "" else
-    ".{" ++ String.intercalate ", " (newLevels.map Name.toString) ++ "}"
-  withOptions (fun _ => printOptions) do
-    let type := (← ppExpr (inlineSiblings info.type siblings)).pretty 100
-    let valueText := (← ppExpr value).pretty 100
-    -- Projection values may use explicit lambda binders for an implicit function type.
-    let valueText := if value.isLambda then "@" ++ valueText else valueText
-    return s!"{kind} _root_.{name}{levels} :\n  {type}\n:=\n  {valueText}\n"
+def checkImportEffects (before after : Document) (target : Option Name := none) : IO Unit :=
+  runMeta after.env do
+    let stage := if target.isSome then "Merge" else "Additional imports"
+    let replaced := target.map (theoremDeclarations before) |>.getD {}
+    let mut mapping : NameMap Name := {}
+    for (name, _) in before.owners.toArray do
+      if let some current := existingName? after.env name then mapping := mapping.insert name current
+    let mut beforeState : CollectAxioms.State := {}
+    let mut afterState : CollectAxioms.State := {}
+    for (name, _) in before.owners.toArray do
+      if replaced.contains name then continue
+      let some old := before.env.find? name | throwError "Missing original declaration: {name}"
+      if (existingName? after.env name).isNone && (privateToUserName name).isInternalDetail then
+        continue
+      let some current := mapping.find? name | throwError "{stage} removed a declaration: {name}"
+      let new ← getConstInfo current
+      unless old.levelParams.length == new.levelParams.length &&
+          (← equalTypes (rewrite old.type mapping) (aligned new.type new.levelParams old.levelParams) true) do
+        throwError "{stage} changed the type of {name}"
+      if isTheorem old then
+        let (_, nextBefore) := ((CollectAxioms.collect name).run before.env).run beforeState
+        -- Only retain visits from valid roots; unfinished proofs must not poison later checks.
+        if nextBefore.axioms.all permittedAxiom then
+          beforeState := nextBefore
+          let (_, nextAfter) := ((CollectAxioms.collect current).run after.env).run afterState
+          let bad := nextAfter.axioms.filter (!permittedAxiom ·)
+          unless bad.isEmpty do
+            throwError "{stage} introduced unsupported axioms in {name}: {bad}"
+          afterState := nextAfter
+      else
+        if let some value := old.value? (allowOpaque := true) then
+          let some newValue := new.value? (allowOpaque := true)
+            | throwError "{stage} changed the declaration kind of {name}"
+          unless ← equalTypes (rewrite value mapping) (aligned newValue new.levelParams old.levelParams) true do
+            throwError "{stage} changed the value of {name}"
 
 def bounds (doc : Document) (stx : Syntax) : IO (String.Pos.Raw × String.Pos.Raw) := do
   let some start := stx.getPos? | throw (IO.userError "Missing syntax start position")
@@ -660,85 +444,287 @@ def extraImports (base donor : Document) : String := Id.run do
       result := result ++ s!"import {imp.module}\n"
   return result
 
+
+-- A source command is reused as a whole, including declarations Lean generates for it.
+def commandRefs (doc : Document) (cmd : CommandData) : NameSet := Id.run do
+  let mut refs := cmd.refs
+  for name in cmd.names do
+    if let some info := doc.env.find? name then refs := refs ++ info.getUsedConstantsAsSet
+  return refs
+
+def nameMapping (base donor : Document) : NameMap Name := Id.run do
+  let mut mapping := {}
+  for (name, _) in donor.owners.toArray do
+    if base.env.contains name then mapping := mapping.insert name name
+    else if let some old := existingName? base.env name then mapping := mapping.insert name old
+  return mapping
+
+def reusableCommand (base donor : Document) (cmd : CommandData)
+    (mapping : NameMap Name) (useDefEq : Bool) (allowUnfinished : Bool := false) : IO Bool := do
+  if cmd.names.isEmpty then return false
+  try
+    runMeta base.env do
+      for name in cmd.names do
+        let some oldName := mapping.find? name | return false
+        let some info := donor.env.find? name | return false
+        let old ← getConstInfo oldName
+        if info.levelParams.length != old.levelParams.length then return false
+        let eq := fun a b => equalTypes
+          (aligned (rewrite a mapping) info.levelParams old.levelParams) b useDefEq
+        unless ← eq info.type old.type do return false
+        match info, old with
+        | .thmInfo _, .thmInfo _ => unless allowUnfinished do checkProof oldName
+        | .inductInfo _, .inductInfo _ | .ctorInfo _, .ctorInfo _ | .recInfo _, .recInfo _ =>
+          checkInductiveMember info mapping useDefEq
+        | .defnInfo a, .defnInfo b =>
+          unless a.safety == b.safety && (← eq a.value b.value) do return false
+        | .opaqueInfo a, .opaqueInfo b =>
+          unless a.isUnsafe == b.isUnsafe && (← eq a.value b.value) do return false
+        | _, _ => return false
+      return true
+  catch _ => return false
+
+-- Equality in the base environment is meaningful only when the constants in a
+-- donor type/definition have also been matched. A reused theorem needs its type,
+-- but may replace an entirely different proof, including a donor placeholder.
+def reusableDependencies (doc : Document) (index : Nat) (reused : Std.HashSet Nat) : Bool := Id.run do
+  let _ : Inhabited Environment := ⟨doc.env⟩
+  for name in doc.commands[index]!.names do
+    let some info := doc.env.find? name | return false
+    let mut refs := info.type.headBeta.getUsedConstantsAsSet
+    unless isTheorem info do
+      if let some value := info.value? (allowOpaque := true) then
+        refs := refs ++ value.headBeta.getUsedConstantsAsSet
+    for dep in refs do
+      if let some owner := doc.owners.find? dep then
+        if owner != index && !reused.contains owner then return false
+  return true
+
+structure Selection where
+  selected : Std.HashSet Nat := {}
+  reused : NameSet := {}
+
+-- Stop at reused declarations. In particular, a donor placeholder may use a completed
+-- declaration from the current file, without copying its sorry or its dependencies.
+def selectCommands (doc : Document) (seeds : Array Nat)
+    (reuse : Std.HashSet Nat := {}) (mapping : NameMap Name := {}) : Selection := Id.run do
+  let _ : Inhabited Environment := ⟨doc.env⟩
+  let mut result : Selection := {}
+  let mut seen : Std.HashSet Nat := {}
+  let mut queue := seeds
+  while !queue.isEmpty do
+    let i := queue.back!
+    queue := queue.pop
+    if seen.contains i then continue
+    seen := seen.insert i
+    let cmd := doc.commands[i]!
+    if reuse.contains i then
+      for name in cmd.names do
+        result := { result with reused := result.reused.insert ((mapping.find? name).getD name) }
+      continue
+    result := { result with selected := result.selected.insert i }
+    queue := queue ++ cmd.scopes ++ (doc.scopeEnds[i]?).getD #[]
+    if isScopeCommand cmd.stx then continue
+    queue := queue ++ cmd.context
+    let refs := commandRefs doc cmd
+    for name in refs do
+      if let some owner := doc.owners.find? name then queue := queue.push owner
+    for j in [:i] do
+      let previous := doc.commands[j]!
+      if hasUntrackedEffect previous ||
+          (isAttributeCommand previous.stx && previous.attributeTargets.toArray.any refs.contains) then
+        queue := queue.push j
+  return result
+
+partial def declarationSyntaxAt? (stx : Syntax) (name : Name) (pos : String.Pos.Raw) : Option Syntax :=
+  if stx.getKind == ``Parser.Command.declaration && (theoremSyntaxAt? stx name pos).isSome then
+    some stx
+  else stx.getArgs.findSome? (fun child => declarationSyntaxAt? child name pos)
+
+def declarationSyntax (doc : Document) (name : Name) : IO Syntax := do
+  let _ : Inhabited Environment := ⟨doc.env⟩
+  let some owner := doc.owners.find? name | throw (IO.userError "Missing declaration owner")
+  let some theoremStx := theoremSyntax? doc name | throw (IO.userError "Expected an explicit theorem/lemma")
+  let some pos := theoremStx[1][0].getPos? | throw (IO.userError "Missing declaration position")
+  return (declarationSyntaxAt? doc.commands[owner]!.stx name pos).getD theoremStx
+
+-- Original text, with only the selected theorem's name/visibility adapted to the target.
+def proofCommand (base donor : Document) (target candidate : Name) : IO String := do
+  let _ : Inhabited Environment := ⟨donor.env⟩
+  let some owner := donor.owners.find? candidate | throw (IO.userError "Missing proof command")
+  let some stx := theoremSyntax? donor candidate | throw (IO.userError "Proof must be an explicit theorem/lemma")
+  let (start, stop) ← bounds donor donor.commands[owner]!.stx
+  let (idStart, idStop) ← bounds donor stx[1][0]
+  let name := if privateToUserName candidate == privateToUserName target then
+      slice donor.source idStart idStop
+    else s!"_root_.{privateToUserName target}"
+  let decl ← declarationSyntax donor candidate
+  let (declStart, _) ← bounds donor decl
+  let (theoremStart, _) ← bounds donor stx
+  let oldDecl ← declarationSyntax base target
+  let some oldTheorem := theoremSyntax? base target | throw (IO.userError "Missing target syntax")
+  let (oldStart, _) ← bounds base oldDecl
+  let (oldTheoremStart, _) ← bounds base oldTheorem
+  -- Keep the target's documentation and attributes. The proof's binders and body stay intact.
+  let modifiers := slice base.source oldStart oldTheoremStart
+  return modifiers.crlfToLf ++ slice donor.source theoremStart idStart ++ name ++
+    slice donor.source idStop stop
+
+def selectedSource (doc : Document) (selected : Std.HashSet Nat)
+    (replacement : Option (Nat × String) := none)
+    (skip : NameSet := {}) (mapping : NameMap Name := {}) : IO String := do
+  let _ : Inhabited Environment := ⟨doc.env⟩
+  let mut output := ""
+  let mut cursor := (headerText doc).rawEndPos
+  for i in [:doc.commands.size] do
+    let cmd := doc.commands[i]!
+    let (start, stop) ← bounds doc cmd.stx
+    if selected.contains i && !(cmd.names.size > 0 &&
+        (cmd.names.all skip.contains || cmd.names.all (fun n => (mapping.find? n).isSome)) &&
+        (replacement.map (fun r => r.1 == i) |>.getD false |>.not)) then
+      let text := match replacement with
+        | some (owner, text) => if owner == i then text else slice doc.source start stop
+        | none => slice doc.source start stop
+      -- Keep comments adjacent to retained commands, including comments before the first one.
+      output := output ++ slice doc.source cursor start ++ text ++ "\n"
+    cursor := stop
+  return output ++ slice doc.source cursor doc.source.rawEndPos
+
+def arrange (base donor : Document) (target candidate : Name) (selection : Selection) : IO String := do
+  let _ : Inhabited Environment := ⟨base.env⟩
+  let targetOwner := base.owners.get! target
+  let replaced := theoremDeclarations base target
+  let wholeTarget := base.commands[targetOwner]!.names.all replaced.contains
+  let removed ← if wholeTarget then pure base.commands[targetOwner]!.stx else declarationSyntax base target
+  let (removeStart, removeStop) ← bounds base removed
+  let (ownerStart, ownerStop) ← bounds base base.commands[targetOwner]!.stx
+  let remainingOwner := slice base.source ownerStart removeStart ++ slice base.source removeStop ownerStop
+  -- Lift original dependencies together with their original context. Scope delimiters
+  -- can be replayed; declarations are removed from their former positions, not copied.
+  let seeds := selection.reused.toArray.filterMap base.owners.find?
+  let lifted := selectCommands base seeds
+  if lifted.selected.contains targetOwner then
+    if wholeTarget then throw (IO.userError "Source order conflict: a dependency needs the unfinished target")
+    for name in base.commands[targetOwner]!.names do
+      if replaced.contains name then continue
+      if let some info := base.env.find? name then
+        if info.getUsedConstantsAsSet.toArray.any replaced.contains then
+          throw (IO.userError "Source order conflict: a mutual dependency needs the unfinished target")
+  let dependencies ← selectedSource base lifted.selected (some (targetOwner, remainingOwner))
+  let replacement ← proofCommand base donor target candidate
+  let mapping := nameMapping base donor
+  let proofSource ← selectedSource donor selection.selected (some (donor.owners.get! candidate, replacement)) selection.reused mapping
+  let mut rest := ""
+  let mut cursor := (headerText base).rawEndPos
+  for i in [:base.commands.size] do
+    let cmd := base.commands[i]!
+    let (start, stop) ← bounds base cmd.stx
+    rest := rest ++ slice base.source cursor start
+    if i == targetOwner then
+      if !lifted.selected.contains i then rest := rest ++ remainingOwner
+    else if lifted.selected.contains i && !isScopeCommand cmd.stx then pure ()
+    else rest := rest ++ slice base.source start stop
+    cursor := stop
+  rest := rest ++ slice base.source cursor base.source.rawEndPos
+  let dependencies := if lifted.selected.isEmpty then "" else "\nsection\n" ++ dependencies.crlfToLf ++ "\nend\n"
+  -- Sections keep submitted variables, local notation and options out of the main file.
+  return headerText base ++ sourceNewlines base
+    (dependencies ++ "\nsection\n" ++ proofSource.crlfToLf ++ "\nend\n") ++ rest
+
 structure Attempt where
   content : String
   candidate : Name
-  inserted : Array Name
   reused : Array Name
+  verified : Document
 
-def attempt (base donor : Document) (target candidate : Name) (useDefEq : Bool)
-    (reuseSiblings : Bool := false) : IO Attempt := do
-  let _ : Inhabited Environment := ⟨base.env⟩
-  let some owner := base.owners.find? target | throw (IO.userError "Missing target command")
-  let command := base.commands[owner]!
-  let some targetInfo := base.env.find? target | throw (IO.userError "Missing target")
-  let some stx := theoremSyntax? base target
-    | throw (IO.userError "Target must be a theorem/lemma declaration")
-  let (start, stop) ← bounds base stx
-  let (commandStart, commandStop) ← bounds base command.stx
-  -- Scoped includes would capture section variables again in a reprinted declaration.
-  let keepBinders := hasScopedInclude command.stx (stx.getPos?.getD 0) ||
-    (!command.included.isEmpty && command.names.any
-      (fun name => name != target && (theoremSyntax? base name).isSome))
-  let (valueStart, _) ← bounds base stx[3]
-  let reserved := reservedPrefixes base.env
-  let (replacement, helpers, state) ← runMeta command.before do
-    let siblings ← if reuseSiblings then
-        availableSiblings base command target (stx.getPos?.getD 0)
-      else pure {}
-    let (root, state) ← (transfer donor useDefEq candidate).run { reserved }
-    let info ← getConstInfo root
-    unless info.levelParams.length == targetInfo.levelParams.length do
-      throwError "Universe parameter counts differ for {candidate} and {target}"
-    let type := aligned info.type info.levelParams targetInfo.levelParams
-    unless ← equalTypes type targetInfo.type useDefEq do
+-- Equation lemmas may be generated lazily by a later tactic. Their source ranges
+-- point to the original definition, not the command that first requested them.
+def declaredInCommand (doc : Document) (cmd : CommandData) (name : Name) : Bool :=
+  match declRangeExt.find? doc.env name, cmd.stx.getPos?, cmd.stx.getTailPos? with
+  | some ranges, some start, some stop =>
+    let pos := doc.source.crlfToLf.toFileMap.ofPosition ranges.selectionRange.pos
+    start ≤ pos && pos < stop
+  | _, _, _ => false
+
+def mergeSelection (base donor : Document) (seeds : Array Nat) (req : Request)
+    (replacement : Option (Name × Name) := none) : IO Selection := do
+  let _ : Inhabited Environment := ⟨donor.env⟩
+  let mapping := nameMapping base donor
+  let owner := replacement.bind fun (_, candidate) => donor.owners.find? candidate
+  let mut reuse : Std.HashSet Nat := {}
+  for i in [:donor.commands.size] do
+    if owner == some i then continue
+    if replacement.any (fun (target, _) =>
+        donor.commands[i]!.names.any (fun n => (mapping.find? n).any (· == target))) then continue
+    if reusableDependencies donor i reuse &&
+        (← reusableCommand base donor donor.commands[i]! mapping req.useDefEq req.declarationsOnly) then
+      reuse := reuse.insert i
+  let selection := selectCommands donor seeds reuse mapping
+  for i in selection.selected.toArray do
+    if owner == some i then continue
+    for name in donor.commands[i]!.names do
+      if let some old := mapping.find? name then
+        let cmd := donor.commands[i]!
+        if !declaredInCommand donor cmd name &&
+            (← reusableCommand base donor { cmd with names := #[name] } mapping req.useDefEq) then continue
+        throw (IO.userError s!"Source name conflict: {privateToUserName name} is not equivalent to existing {privateToUserName old}; rename it in the submitted source")
+  return selection
+
+unsafe def attempt (base donor : Document) (target candidate : Name) (req : Request) : IO Attempt := do
+  let selection ← mergeSelection base donor #[donor.owners.get! candidate] req (some (target, candidate))
+  let content ← arrange base donor target candidate selection
+  let verified ← analyze content `LeanMergeBase req.setup
+  let newTarget ← resolve verified (privateToUserName target).toString
+  checkImportEffects base verified (some target)
+  runMeta verified.env do
+    let some before := base.env.find? target | throwError "Original target is missing"
+    let after ← getConstInfo newTarget
+    let mut currentNames : NameMap Name := {}
+    for (name, _) in base.owners.toArray do
+      if let some current := existingName? verified.env name then
+        currentNames := currentNames.insert name current
+    unless before.levelParams.length == after.levelParams.length &&
+        (← equalTypes (rewrite before.type currentNames) (aligned after.type after.levelParams before.levelParams) req.useDefEq) do
       throwError "Type mismatch: {candidate} does not prove {target}"
-    checkProof root
-    let required ← requiredTransfers command.before root
-    let state := { state with emitted := state.emitted.filter required.contains }
-    let some proofValue := info.value? (allowOpaque := true) | throwError "No proof value for {root}"
-    let value := aligned proofValue info.levelParams targetInfo.levelParams
-    let replacement ← if keepBinders then do
-        let term ← withOptions (fun _ => printOptions) do
-          return (← ppExpr (inlineSiblings (.const root (targetInfo.levelParams.map Level.param)) siblings)).pretty 100
-        pure <| (slice base.source start valueStart).crlfToLf ++
-          s!":= by apply ({term}) <;> assumption\n"
-      else
-        render (.thmInfo {
-          name := target, levelParams := targetInfo.levelParams, type := targetInfo.type, value })
-          (privateToUserName target) command.levels siblings
-    let mut helpers := ""
-    for name in state.emitted do
-      if name == root && !keepBinders then continue
-      helpers := helpers ++ (← render (← getConstInfo name) name command.levels siblings) ++ "\n"
-    return (replacement, helpers, state)
-  let included := String.intercalate " " (command.included.map Name.toString)
-  let omitCmd := if included.isEmpty then "" else s!"omit {included}\n"
-  let restoreCmd := if included.isEmpty then "" else s!"\ninclude {included}\n"
-  let content := slice base.source 0 commandStart ++
-    sourceNewlines base (omitCmd ++ helpers ++ if keepBinders then restoreCmd else "") ++
-    slice base.source commandStart start ++ sourceNewlines base replacement ++
-    slice base.source stop commandStop ++ sourceNewlines base (if keepBinders then "" else restoreCmd) ++
-    slice base.source commandStop base.source.rawEndPos
-  return {
-    content, candidate
-    inserted := state.emitted.filter (fun n => keepBinders || n != (state.mapping.find? candidate).getD candidate)
-    reused := state.reused }
+    checkProofs (#[newTarget] ++ (verified.owners.toArray.map (·.1)).filter
+      (fun n => (existingName? base.env n).isNone))
+  return { content, candidate, reused := selection.reused.toArray, verified }
 
--- Record every declaration generated by each inserted command, including constructors,
--- recursors and projection helpers, so callers can prune unused proof dependencies.
-def addedCommands (doc : Document) (inserted : Array Name) : Array SavedCommand := Id.run do
-  let _ : Inhabited Environment := ⟨doc.env⟩
-  let owners := inserted.filterMap doc.owners.find?
+def addedCommands (before after : Document) (target : Option Name := none) : IO (Array SavedCommand) := do
   let mut added := #[]
-  for i in [:doc.commands.size] do
-    if owners.contains i then
-      added := added.push {
-        names := doc.commands[i]!.names.map (fun n => ((privateToUserName n).eraseMacroScopes).toString)
-        source := "" }
+  for cmd in after.commands do
+    if target.any (fun t => cmd.names.any (fun n => privateToUserName n == privateToUserName t)) then continue
+    let names := cmd.names.filter fun name =>
+      (existingName? before.env name).isNone
+    if names.isEmpty then continue
+    let (start, stop) ← bounds after cmd.stx
+    added := added.push {
+      names := names.map (fun n => ((privateToUserName n).eraseMacroScopes).toString)
+      source := slice after.source start stop }
   return added
 
+unsafe def mergeDeclarations (base donor : Document) (req : Request) : IO Json := do
+  let selection ← mergeSelection base donor (Array.range donor.commands.size) req
+  let source ← selectedSource donor selection.selected (mapping := nameMapping base donor)
+  let header := headerText base
+  -- Each input starts with its own variables, local notation, options and open namespaces.
+  let content := header ++ sourceNewlines base "\nsection\n" ++
+    slice base.source header.rawEndPos base.source.rawEndPos ++
+    sourceNewlines base ("\nend\n\nsection\n" ++ source.crlfToLf ++ "\nend\n")
+  let verified ← analyze content `LeanMergeBase req.setup
+  checkImportEffects base verified
+  let inserted := (verified.owners.toArray.map (·.1)).filter (fun n => (existingName? base.env n).isNone)
+  let usedAxioms ← runMeta verified.env (checkedAxioms inserted)
+  let additions ← addedCommands base verified
+  return json% { "okay": true, "content": $content, "source": $content,
+    "strategy": "source", "declarations_only": true, "added_commands": $additions,
+    "target": null, "proof": null, "inserted": $(additions.flatMap (·.names)),
+    "reused": $(selection.reused.toArray.map Name.toString), "verified": true,
+    "axioms": $(usedAxioms.map Name.toString) }
+
 unsafe def merge (req : Request) : IO Json := do
+  if req.declarationsOnly && (!req.target.isEmpty || !req.proof.isEmpty) then
+    throw (IO.userError "--declarations-only cannot be combined with --target or --proof")
   let original ← analyze req.base `LeanMergeBase req.setup
   let donor ← analyze req.donor `LeanMergeDonor req.setup
   let additions := extraImports original donor
@@ -747,123 +733,57 @@ unsafe def merge (req : Request) : IO Json := do
     slice req.base 0 headerEnd ++ sourceNewlines original ("\n" ++ additions) ++ slice req.base headerEnd req.base.rawEndPos
   let base ← if additions.isEmpty then pure original else analyze combined `LeanMergeBase req.setup
   unless additions.isEmpty do checkImportEffects original base
+  if req.declarationsOnly then return ← mergeDeclarations base donor req
   let target ← if req.target.isEmpty then do
-      let mut unfinished := #[]
-      for name in declaredTheorems base do
-        if hasOwnSorry base (theoremDeclarations base name) name then unfinished := unfinished.push name
+      let unfinished := (declaredTheorems base).filter fun name =>
+        hasOwnSorry base (theoremDeclarations base name) name
       match unfinished.toList with
       | [name] => pure name
       | _ => throw (IO.userError s!"Specify --target; found {unfinished.size} theorems with their own sorry: {unfinished.toList}")
     else resolve base req.target
   unless (← axioms base.env target).contains ``sorryAx do
     throw (IO.userError s!"Target {target} already has a complete proof")
-  let candidates ← if req.proof.isEmpty then pure (theorems donor) else
-    pure #[← resolve donor req.proof]
+  let candidates ← if req.proof.isEmpty then pure (declaredTheorems donor) else pure #[← resolve donor req.proof]
+  let exact := candidates.filter (fun n => privateToUserName n == privateToUserName target)
   let mut successes : Array Attempt := #[]
   let mut failures : Array String := #[]
-  -- Extra reusable siblings must not make a previously unique proof ambiguous.
-  for reuseSiblings in [false, true] do
+  for group in [exact, candidates.filter (!exact.contains ·)] do
     if !successes.isEmpty then break
-    failures := #[]
-    for candidate in candidates do
-      try
-        successes := successes.push (← attempt base donor target candidate req.useDefEq reuseSiblings)
+    for candidate in group do
+      try successes := successes.push (← attempt base donor target candidate req)
       catch e => failures := failures.push s!"{candidate}: {e}"
   let selected ← match successes.toList with
     | [one] => pure one
     | [] => throw (IO.userError ("No compatible complete proof found.\n" ++ String.intercalate "\n" failures.toList))
-    | many =>
-      let exact := many.filter (fun a => privateToUserName a.candidate == privateToUserName target)
-      match exact with
-      | [one] => pure one
-      | _ => throw (IO.userError s!"Multiple matching proofs; specify --proof: {many.map (·.candidate)}")
-  let verified ← analyze selected.content `LeanMergeBase req.setup
-  checkImportEffects original verified (some target)
-  runMeta verified.env do
-    let some before := original.env.find? target | throwError "Original target is missing"
-    let after ← getConstInfo target
-    unless before.levelParams.length == after.levelParams.length &&
-        (← equalTypes before.type (aligned after.type after.levelParams before.levelParams) req.useDefEq) do
-      throwError "Verification changed the target type"
-    checkProofs (#[target] ++ (verified.owners.toArray.map (·.1)).filter
-      (!original.env.contains ·))
+    | many => throw (IO.userError s!"Multiple matching proofs; specify --proof: {many.map (·.candidate)}")
+  let additions ← addedCommands base selected.verified (some target)
+  let newTarget ← resolve selected.verified (privateToUserName target).toString
   return json% { "okay": true, "content": $(selected.content), "source": $(selected.content),
-    "strategy": "expression", "added_commands": $(addedCommands verified selected.inserted), "target": $(target.toString),
-    "proof": $(selected.candidate.toString), "inserted": $(selected.inserted.map Name.toString),
+    "strategy": "source", "added_commands": $additions, "target": $(newTarget.toString),
+    "proof": $(selected.candidate.toString), "inserted": $(additions.flatMap (·.names)),
     "reused": $(selected.reused.map Name.toString), "verified": true,
-    "axioms": $((← axioms verified.env target).map Name.toString) }
+    "axioms": $((← axioms selected.verified.env newTarget).map Name.toString) }
 
+-- Compatibility entry point: normalization now extracts original commands and scopes.
 unsafe def normalize (req : Request) : IO Json := do
   let doc ← analyze req.base `LeanMergeNormalize req.setup
-  let selected ← if req.target.isEmpty then pure ((declaredTheorems doc).filter (!isPrivateName ·))
+  let targets ← if req.target.isEmpty then pure ((declaredTheorems doc).filter (!isPrivateName ·))
     else pure #[← resolve doc req.target]
-  if selected.isEmpty then throw (IO.userError "No theorems to normalize")
-  let (content, count, nameMapping) ← runMeta doc.initial do
-    let action : TransferM Unit := do
-      for name in selected do discard <| transfer doc req.useDefEq name
-    let reserved := reservedPrefixes doc.env
-    let (_, state) ← action.run { reserved }
-    let mut mapping : NameMap Name := {}
-    let mut nameMapping : NameMap Name := {}
-    let inductiveOwners := doc.owners.toArray.filterMap fun (name, owner) =>
-      if (doc.env.find? name).any (fun ci => ci matches .inductInfo _) then some owner else none
-    for (name, fresh) in state.mapping.toArray do
-      -- Re-elaborating an inductive regenerates casesOn, noConfusion, sizeOf, etc.
-      -- Keep transferred definitions under fresh names to avoid redeclaring them.
-      let generated := (doc.owners.find? name).any inductiveOwners.contains &&
-        (doc.env.find? name).any (fun ci => (ci.value? (allowOpaque := true)).isSome)
-      let restored := if isPrivateName name || generated then fresh ++ `normalized else name
-      mapping := mapping.insert fresh restored
-    for (name, fresh) in state.mapping.toArray do
-      if let some (.inductInfo info) := doc.env.find? name then
-        for ci in ← inductiveGroup doc info do
-          if name.isPrefixOf ci.name then
-            let old := state.mapping.get! ci.name
-            mapping := mapping.insert old (old.replacePrefix fresh (mapping.get! fresh))
-    -- Sharing helpers must also be rebuilt against the restored inductive types.
-    for fresh in state.emitted do
-      unless mapping.contains fresh do mapping := mapping.insert fresh (fresh ++ `normalized)
-    for (name, fresh) in state.mapping.toArray do
-      nameMapping := nameMapping.insert name (mapping.get! fresh)
-    for name in selected do
-      if isPrivateName name then throwError "Private target theorems are not supported yet"
-    let mut content := headerText doc ++ "\n\n"
-    for fresh in state.emitted do
-      let info ← getConstInfo fresh
-      let name := (mapping.find? fresh).getD fresh
-      if let .inductInfo val := info then
-        if name != fresh then
-          let mut types : List InductiveType := []
-          for n in val.all do
-            let induct := (← getConstInfo n).inductiveVal!
-            let ctors ← induct.ctors.mapM fun ctor => do
-              let type := rewrite (← getConstInfo ctor).type mapping
-              return ({ name := (mapping.find? ctor).getD ctor, type } : Constructor)
-            let type := rewrite induct.type mapping
-            types := types ++ [{ name := (mapping.find? n).getD n, type, ctors }]
-          addInductive (.inductDecl val.levelParams val.numParams types false)
-        content := content ++ (← render (← getConstInfo name) name) ++ "\n"
-        continue
-      let some value := info.value? (allowOpaque := true) | throwError "No value for {fresh}"
-      let decl ← declaration info name (rewrite info.type mapping) (rewrite value mapping)
-      if name != fresh then addDecl decl
-      let info := match decl with
-        | .thmDecl v => ConstantInfo.thmInfo v
-        | .defnDecl v => .defnInfo v
-        | .opaqueDecl v => .opaqueInfo v
-        | _ => info
-      content := content ++ (← render info name) ++ "\n"
-    return (content, state.emitted.size, nameMapping)
+  if targets.isEmpty then throw (IO.userError "No theorems to normalize")
+  let selection := selectCommands doc (targets.map (fun n => doc.owners.get! n))
+  let content := headerText doc ++ (← selectedSource doc selection.selected)
   let verified ← analyze content `LeanMergeNormalize req.setup
-  for name in selected do
-    let some old := doc.env.find? name | throw (IO.userError "Missing original theorem")
-    let some new := verified.env.find? name | throw (IO.userError "Missing normalized theorem")
+  let mapping := nameMapping verified doc
+  for target in targets do
+    let newTarget ← resolve verified (privateToUserName target).toString
+    let some old := doc.env.find? target | throw (IO.userError "Missing original theorem")
+    let some new := verified.env.find? newTarget | throw (IO.userError "Missing extracted theorem")
     unless old.levelParams.length == new.levelParams.length &&
-        (← runMeta verified.env (equalTypes (rewrite old.type nameMapping)
+        (← runMeta verified.env (equalTypes (rewrite old.type mapping)
           (aligned new.type new.levelParams old.levelParams) req.useDefEq)) do
-      throw (IO.userError s!"Normalization changed theorem type: {name}")
+      throw (IO.userError s!"Extraction changed theorem type: {target}")
   return json% { "okay": true, "verified": true, "content": $content,
-    "normalize_stats": { "declarations": $count }, "targets": $(selected.map Name.toString) }
+    "normalize_stats": { "declarations": $selection.selected.size }, "targets": $(targets.map Name.toString) }
 
 end LeanMerge
 

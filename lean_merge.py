@@ -1,4 +1,4 @@
-"""Local, kernel-checked replacement of a Lean theorem's unfinished proof."""
+"""Merge original Lean source commands in dependency order and check the result."""
 
 from __future__ import annotations
 
@@ -7,12 +7,16 @@ import json
 import math
 import os
 from pathlib import Path
+import runpy
 import shutil
 import signal
 import subprocess
 import sys
 import tempfile
 import time
+
+
+FailureArchive = runpy.run_path(str(Path(__file__).with_name("failure_archive.py")))["FailureArchive"]
 
 
 WORKER = Path(__file__).resolve().with_name("LeanMerge.lean")
@@ -49,8 +53,10 @@ class Runner:
                 stdout, stderr = process.communicate(timeout=remaining)
             except subprocess.TimeoutExpired:
                 os.killpg(process.pid, signal.SIGKILL)
-                process.communicate()
-                raise MergeError("Lean operation timed out") from None
+                stdout, stderr = process.communicate()
+                error = MergeError("Lean operation timed out")
+                error.stdout, error.stderr = stdout, stderr
+                raise error from None
         if process.returncode:
             raise MergeError((stderr + stdout).strip() or f"Command failed: {argv[0]}")
         return stdout
@@ -63,11 +69,24 @@ def _read_result(path: Path) -> dict:
 
 
 def _execute(
+    mode: str, base: str, donor: str = "", **options,
+) -> dict:
+    sources = {"base.lean": base}
+    if mode == "merge":
+        sources["donor.lean"] = donor
+    with FailureArchive(WORKER.parent, mode, sources, options) as archive:
+        return _execute_unrecorded(mode, base, donor, archive=archive, **options)
+
+
+def _execute_unrecorded(
     mode: str, base: str, donor: str = "", *, target: str | None = None,
     proof: str | None = None, project: str | Path | None = None,
     lean: str = "lean", timeout: float = 120, use_def_eq: bool = True,
-    source_path: Path | None = None,
+    declarations_only: bool = False,
+    source_path: Path | None = None, archive: FailureArchive,
 ) -> dict:
+    if declarations_only and (mode != "merge" or target or proof):
+        raise MergeError("--declarations-only requires merge without --target or --proof")
     origin = source_path or Path.cwd() / "Input.lean"
     project_path = Path(project).expanduser().resolve() if project else find_project(origin)
     if project_path and not any((project_path / name).is_file() for name in ("lakefile.lean", "lakefile.toml")):
@@ -82,8 +101,10 @@ def _execute(
     runner.env["PATH"] = str(prefix / "bin") + os.pathsep + runner.env.get("PATH", "")
     runner.env["LEAN_SYSROOT"] = str(prefix)
     started = time.monotonic()
-    with tempfile.TemporaryDirectory(prefix="lean-merge-") as directory:
+    with tempfile.TemporaryDirectory(prefix="lean-merge-") as directory, archive:
         work = Path(directory)
+        archive.files.update({name: work / name for name in
+                              ("Input0.lean", "Input1.lean", "request.json", "result.json")})
         setup = None
         if project_path:
             lake = str(prefix / "bin" / "lake")
@@ -107,26 +128,26 @@ def _execute(
         result_path = work / "result.json"
         request = {
             "mode": mode, "base": base, "donor": donor, "target": target or "",
-            "proof": proof or "", "useDefEq": use_def_eq,
+            "proof": proof or "", "useDefEq": use_def_eq, "declarationsOnly": declarations_only,
             "result": str(result_path), "setup": setup,
         }
         request_path.write_text(json.dumps(request, ensure_ascii=False), encoding="utf-8")
         runner.run([executable, "--run", str(WORKER), str(request_path)])
         result = _read_result(result_path)
-    if not result.get("okay") or not result.get("verified"):
-        raise MergeError("Lean worker did not confirm verification")
+        if not result.get("okay") or not result.get("verified"):
+            raise MergeError("Lean worker did not confirm verification")
     result["lean_version"] = version
     result["timings"] = {"total_ms": round((time.monotonic() - started) * 1000)}
     return result
 
 
 def merge(base: str, donor: str, **options) -> dict:
-    """Replace one unfinished theorem, returning verified Lean source and metadata."""
+    """Replace one unfinished theorem, or add declarations with declarations_only=True."""
     return _execute("merge", base, donor, **options)
 
 
 def normalize(content: str, **options) -> dict:
-    """Export closed theorem terms and their dependencies, then re-elaborate them."""
+    """Extract original theorem commands and their dependencies without expanding terms."""
     return _execute("normalize", content, **options)
 
 
@@ -156,8 +177,10 @@ def main(argv: list[str] | None = None) -> int:
         command = subparsers.add_parser(mode)
         command.add_argument("base", help="Lean source file, or - for stdin")
         if mode == "merge":
-            command.add_argument("donor", help="Lean file containing the proof, or - for stdin")
+            command.add_argument("donor", help="Lean file containing proofs or declarations, or - for stdin")
             command.add_argument("--proof", help="donor theorem name; inferred by type if omitted")
+            command.add_argument("--declarations-only", action="store_true",
+                                 help="add donor declarations while preserving existing proofs and sorry placeholders")
         command.add_argument("--target", help="target theorem name; fully qualified if ambiguous")
         command.add_argument("-o", "--output", type=Path, help="write Lean source here; defaults to stdout")
         command.add_argument("--project", type=Path, help="Lake project, including built Mathlib dependencies")
@@ -168,36 +191,46 @@ def main(argv: list[str] | None = None) -> int:
         command.add_argument("--force", action="store_true", help="replace an existing output after verification")
     args = parser.parse_args(argv)
     try:
-        inputs = [args.base] + ([args.donor] if args.mode == "merge" else [])
-        if inputs.count("-") > 1:
-            raise MergeError("Only one input may read stdin")
-        output = args.output.expanduser().absolute() if args.output else None
-        if output:
-            for name in inputs:
-                if name != "-" and (output.resolve() == Path(name).resolve() or
-                    (output.exists() and os.path.samefile(output, name))):
-                    raise MergeError("Output must differ from all input files, including with --force")
-            if output.is_symlink():
-                raise MergeError("Output must not be a symbolic link")
-            if output.exists() and not args.force:
-                raise MergeError(f"Output exists: {output}; use --force to replace it")
-        result = _execute(
-            args.mode, read_source(args.base),
-            read_source(args.donor) if args.mode == "merge" else "",
-            target=args.target, proof=getattr(args, "proof", None),
-            project=args.project, lean=args.lean, timeout=args.timeout,
-            use_def_eq=not args.no_def_eq,
-            source_path=Path(args.base).resolve() if args.base != "-" else None,
-        )
-        if output:
-            publish(output, result["content"], args.force)
-        if args.json:
-            print(json.dumps(result, ensure_ascii=False, indent=2))
-        elif not output:
-            print(result["content"], end="")
-        else:
-            print(f"Verified: {output}", file=sys.stderr)
-        return 0
+        with FailureArchive(WORKER.parent, args.mode,
+                            {"base.lean": Path(args.base)} if args.base != "-" else {}, vars(args)) as archive:
+            if args.mode == "merge" and args.donor != "-":
+                archive.sources["donor.lean"] = Path(args.donor)
+            inputs = [args.base] + ([args.donor] if args.mode == "merge" else [])
+            if inputs.count("-") > 1:
+                raise MergeError("Only one input may read stdin")
+            output = args.output.expanduser().absolute() if args.output else None
+            if output:
+                for name in inputs:
+                    if name != "-" and (output.resolve() == Path(name).resolve() or
+                        (output.exists() and os.path.samefile(output, name))):
+                        raise MergeError("Output must differ from all input files, including with --force")
+                if output.is_symlink():
+                    raise MergeError("Output must not be a symbolic link")
+                if output.exists() and not args.force:
+                    raise MergeError(f"Output exists: {output}; use --force to replace it")
+            base = read_source(args.base)
+            archive.sources["base.lean"] = base
+            donor = read_source(args.donor) if args.mode == "merge" else ""
+            if args.mode == "merge":
+                archive.sources["donor.lean"] = donor
+            result = _execute(
+                args.mode, base, donor,
+                target=args.target, proof=getattr(args, "proof", None),
+                project=args.project, lean=args.lean, timeout=args.timeout,
+                use_def_eq=not args.no_def_eq,
+                declarations_only=getattr(args, "declarations_only", False),
+                source_path=Path(args.base).resolve() if args.base != "-" else None,
+            )
+            archive.sources["candidate.lean"] = result["content"]
+            if output:
+                publish(output, result["content"], args.force)
+            if args.json:
+                print(json.dumps(result, ensure_ascii=False, indent=2))
+            elif not output:
+                print(result["content"], end="")
+            else:
+                print(f"Verified: {output}", file=sys.stderr)
+            return 0
     except (MergeError, OSError, ValueError) as error:
         if getattr(args, "json", False):
             print(json.dumps({"okay": False, "errors": [str(error)]}, ensure_ascii=False))
